@@ -1155,9 +1155,15 @@ async function pdfLines(file){
       r.it.forEach(i => { if (end !== null){ const gap = i.x - end; txt += gap > 8 ? '   ' : gap > 0.6 ? ' ' : ''; } txt += i.s; end = i.x + i.w; });
       lines.push(txt.replace(/ /g,' ').trimEnd());
     });
-    if (lines.some(l => /OBSERVA[ÇC][ÕO]ES|CONTRATO DE PRESTA/i.test(l))) break; // o contrato não interessa
   }
   return lines;
+}
+// PDF em lote (impressão em lote do GestãoClick): separa cada OS pelo cabeçalho "PEDIDO Nº"
+function splitOS(lines){
+  const ps = []; lines.forEach((l, i) => { if (/PEDIDO\s*N[ºo°.]*\s*\d+/i.test(l)) ps.push(i); });
+  if (ps.length <= 1) return [lines];
+  const ini = ps.map((p, k) => { if (!k) return 0; const lim = ps[k-1] + 1; let s = p; for (let j = p; j >= Math.max(lim, p - 12); j--) if (/MASTER SPORTWEAR|Vendedor:|CNPJ:\s*49/i.test(lines[j])) s = j; return s; });
+  return ini.map((s, k) => lines.slice(s, k + 1 < ini.length ? ini[k+1] : lines.length));
 }
 const brNum = s => { if (s===undefined||s===null) return 0; s = String(s).replace(/[^\d,.-]/g,''); if (s.includes(',')) s = s.replace(/\./g,'').replace(',','.'); return +s || 0; };
 const brDate = s => { const m = String(s||'').match(/(\d{2})\/(\d{2})\/(\d{4})/); return m ? `${m[3]}-${m[2]}-${m[1]}` : null; };
@@ -1174,15 +1180,24 @@ function parseOS(lines, fileName){
   const o = { arquivo:fileName, os:get(/PEDIDO\s*N[ºo°.]*\s*(\d+)/i), data:null, vendedor:get(/Vendedor:\s*([^\n]+)/i), prazo:brDate(get(/PRAZO DE ENTREGA:\s*(\d{2}\/\d{2}\/\d{4})/i)),
     canal:get(/ACHOU A LOJA\s*\?\s*:?\s*(.*?)(?:\s{2,}|\s*DATA DO|\n|$)/i), cliente:get(/Cliente:\s*(.*?)(?:\s{2,}|\s*CNPJ|\n|$)/i),
     cidade:get(/Cidade:\s*(.*?)(?:\s{2,}|\s*Estado|\n|$)/i), uf:get(/Estado:\s*([A-Z]{2})/), itens:[], pagamentos:[], avisos:[] };
+  if (!o.cliente) o.cliente = get(/Nome fantasia:\s*(.*?)(?:\s{2,}|\n|$)/i) || get(/Raz[ãa]o social:\s*(.*?)(?:\s{2,}|\s*Nome fantasia|\n|$)/i);
+  if (!o.cidade){ const cu = all.match(/Cidade\/UF:\s*([^\n]*?)\/([A-Z]{2})\b/i); if (cu){ o.cidade = cu[1].trim(); o.uf = cu[2].toUpperCase(); } }
   const pl = lines.find(l => /PEDIDO\s*N/i.test(l)); o.data = brDate(pl) || brDate(all.match(/\d{2}\/\d{2}\/\d{4}/)?.[0]);
   o.produtos = brNum(get(/PRODUTOS:\s*([\d.,]+)/i)); o.frete = brNum(get(/FRETE:\s*([\d.,]+)/i)); o.desconto = brNum(get(/DESCONTO:\s*([\d.,]+)/i));
   o.servicos = brNum(get(/SERVI[ÇC]OS:\s*([\d.,]+)/i)); o.total = brNum(get(/TOTAL:\s*R\$\s*([\d.,]+)/i)) || (o.produtos + o.servicos + o.frete - o.desconto);
   // itens
   let i0 = lines.findIndex(l => /ITEM\s+NOME/i.test(l));
-  if (i0 >= 0) for (let i = i0+1; i < lines.length; i++){
-    const l = lines[i].trim(); if (/^TOTAL\b/i.test(l) || /PRODUTOS:/i.test(l)) break;
-    const p = l.split(/\s{2,}/); if (p.length >= 5 && /^\d+$/.test(p[0])) { const n = p.length; o.itens.push({nome:p.slice(1, n-4).join(' ') || p[1], und:p[n-4], qtd:brNum(p[n-3]), unit:brNum(p[n-2]), sub:brNum(p[n-1])}); }
-    else if (p.length >= 4 && /^\d+\s/.test(p[0])) { const m = p[0].match(/^(\d+)\s+(.*)$/); const n = p.length; o.itens.push({nome:m[2], und:p[n-4]||'', qtd:brNum(p[n-3]), unit:brNum(p[n-2]), sub:brNum(p[n-1])}); }
+  if (i0 >= 0){
+    const tail = /DESC/i.test(lines[i0]) ? 5 : 4; // UND, QTD, VR. UNIT., [DESC.], SUBTOTAL
+    const soTexto = l => l && l.trim() && !/^\d/.test(l.trim()) && !/^TOTAL\b|ITEM\s+NOME|PRODUTOS:/i.test(l.trim()) ? l.trim() : '';
+    for (let i = i0+1; i < lines.length; i++){
+      const l = lines[i].trim(); if (/^TOTAL\b/i.test(l) || /PRODUTOS:/i.test(l)) break;
+      const p = l.split(/\s{2,}/); const m = (p[0]||'').match(/^(\d+)(?:\s+(.*))?$/); if (!m) continue;
+      const rest = p.slice(1); if (rest.length < tail) continue;
+      const t = rest.slice(rest.length - tail); let nome = [m[2], ...rest.slice(0, rest.length - tail)].filter(Boolean).join(' ');
+      if (!nome) nome = [soTexto(lines[i-1]), soTexto(lines[i+1])].filter(Boolean).join(' ');
+      o.itens.push({nome, und:t[0], qtd:brNum(t[1]), unit:brNum(t[2]), desc:tail===5?brNum(t[3]):0, sub:brNum(t[tail-1])});
+    }
   }
   o.pecas = sum(o.itens, x => x.qtd);
   // pagamentos
@@ -1198,12 +1213,15 @@ function parseOS(lines, fileName){
   // classificação sugerida
   o.pagamentos.forEach(p => {
     const noAto = p.venc && o.data && p.venc <= o.data;
+    const cartaoPassado = (p.forma === 'Crédito' || p.forma === 'Débito') && p.venc && p.venc <= TODAY; // cartão com data já passada = já foi passado na maquininha
     p.parcelas = Math.max(1, +((p.obs.match(/(\d+)\s*x/i)||[])[1] || 1));
-    p.destino = p.forma === 'Duplicata' ? 'duplicata' : noAto ? 'sinal' : 'duplicata';
+    p.destino = p.forma === 'Duplicata' ? 'duplicata' : (noAto || cartaoPassado) ? 'sinal' : 'duplicata';
     p.operadora = Object.keys(S.cfg.taxas)[0] || 'Stone';
   });
   if (!o.os) o.avisos.push('Número do pedido não encontrado.');
-  if (!o.pagamentos.length) o.avisos.push('Nenhuma linha em “Dados do pagamento”.');
+  o.obsOS = get(/OBSERVA[ÇC][ÃA]O:[ \t]*(.*?)(?:\s*DATA DE ENTREGA|\n|$)/i);
+  if (!o.total && !o.pagamentos.length){ o.skip = true; o.pendencia = true; o.avisos.push(`OS sem valor${o.obsOS ? ' (' + o.obsOS + ')' : ''} — pendência/retrabalho, desmarcada.`); }
+  else if (!o.pagamentos.length) o.avisos.push('Nenhuma linha em “Dados do pagamento”.');
   const sp = sum(o.pagamentos, p => p.valor); if (o.total && Math.abs(sp - o.total) > 0.05) o.avisos.push(`Soma dos pagamentos (${money(sp)}) difere do total do pedido (${money(o.total)}).`);
   o.existente = osJaLancada(o.os);
   return o;
@@ -1217,8 +1235,8 @@ window.importarOS = () => {
   openModal(`<div class="modal-h"><h3>📄 Importar Ordem de Serviço (PDF)</h3><button class="x" onclick="closeModal()">×</button></div>
     <div class="modal-b" style="display:block">
       <label id="drop" class="drop"><input type="file" accept="application/pdf,.pdf" multiple style="display:none" onchange="lerPDFs(this.files)">
-        <div style="font-size:30px">📄</div><b>Arraste os PDFs das ordens de serviço aqui</b><span class="muted">ou clique para escolher · pode selecionar várias de uma vez</span></label>
-      <div class="muted" style="font-size:12px;margin-top:12px">O sistema lê <b>Dados do pagamento</b> do pedido e sugere: pagamento no ato da venda → <b>sinal</b> (e <b>cartão</b>, quando for crédito/débito); pagamento futuro ou “Duplicata” → <b>duplicata a receber</b>. Você confere tudo antes de lançar.</div>
+        <div style="font-size:30px">📄</div><b>Arraste os PDFs das ordens de serviço aqui</b><span class="muted">ou clique para escolher · vale OS avulsa ou o PDF de <b>impressão em lote</b> do GestãoClick (várias OS num arquivo só)</span></label>
+      <div class="muted" style="font-size:12px;margin-top:12px">O sistema lê <b>Dados do pagamento</b> do pedido e sugere: pagamento no ato da venda (ou cartão com data já passada) → <b>sinal</b> (e <b>cartão</b>, quando for crédito/débito); pagamento futuro ou “Duplicata” → <b>duplicata a receber</b>; OS de pendência sem valor ficam desmarcadas. Você confere tudo antes de lançar.</div>
     </div>`, 'lg');
   const d = $('#drop');
   ['dragenter','dragover'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.add('on'); }));
@@ -1230,7 +1248,7 @@ window.lerPDFs = async files => {
   $('#modal .modal-b').innerHTML = `<div class="empty">Lendo ${files.length} PDF(s)…</div>`;
   IMP = [];
   for (const f of files){
-    try { IMP.push(parseOS(await pdfLines(f), f.name)); }
+    try { const partes = splitOS(await pdfLines(f)); partes.forEach(ls => IMP.push(parseOS(ls, f.name))); }
     catch(e){ IMP.push({arquivo:f.name, erro: e.message || 'Não foi possível ler este PDF.'}); }
   }
   previewImport();
@@ -1264,9 +1282,14 @@ function previewImport(){
       <div class="tbl-wrap"><table class="imp-t"><thead><tr><th>Vencimento</th><th class="num">Valor</th><th>Forma (PDF)</th><th>Lançar como</th><th>Detalhe</th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="empty">Sem pagamentos.</td></tr>'}</tbody></table></div>
       <div class="imp-sum">Sinal: <b>${money(sinal)}</b> · Duplicata: <b>${money(dup)}</b> · Total: <b>${money(sinal+dup)}</b> ${Math.abs(sinal+dup-o.total)<=0.05?'<span class="tag good">confere com o pedido</span>':'<span class="tag warn">não confere com o pedido</span>'}</div></div>`;
   };
-  const ok = IMP.filter(o=>!o.erro && !o.skip);
+  const ok = IMP.filter(o=>!o.erro && !o.skip), pend = IMP.filter(o=>o.pendencia), rep = ok.filter(o=>o.existente && !o.substituir), bate = ok.filter(o=>Math.abs(sum(o.pagamentos.filter(p=>p.destino!=='ignorar'),p=>p.valor)-o.total)<=0.05);
+  const resumo = IMP.length > 1 ? `<div class="imp-sum" style="margin:0 0 12px;padding:10px 12px;border:1px solid var(--border-2);border-radius:10px;background:var(--surface)">
+      <b>${IMP.length}</b> OS no(s) arquivo(s) · <b>${ok.length}</b> selecionada(s) · total <b>${money(sum(ok,o=>o.total))}</b>
+      ${bate.length===ok.length?'<span class="tag good">todas conferem com o pedido</span>':`<span class="tag warn">${ok.length-bate.length} não conferem</span>`}
+      ${pend.length?`<span class="tag neutral">${pend.length} pendência(s) sem valor desmarcada(s)</span>`:''}${rep.length?`<span class="tag warn">${rep.length} já lançada(s) — serão puladas</span>`:''}
+      <span style="margin-left:auto;display:flex;gap:6px"><button class="btn sm" onclick="IMP.forEach(o=>{if(!o.erro&&!o.pendencia)o.skip=false});previewImport()">Marcar todas</button><button class="btn sm" onclick="IMP.forEach(o=>o.skip=true);previewImport()">Desmarcar todas</button></span></div>` : '';
   $('#modal').innerHTML = `<div class="modal-h"><h3>Conferir importação · ${IMP.length} OS</h3><button class="x" onclick="closeModal()">×</button></div>
-    <div class="modal-b" style="display:block;max-height:68vh;overflow:auto">${IMP.map(card).join('')}</div>
+    <div class="modal-b" style="display:block;max-height:68vh;overflow:auto">${resumo}${IMP.map(card).join('')}</div>
     <div class="modal-f"><button class="btn ghost" onclick="importarOS()">← Outros PDFs</button><span style="flex:1"></span><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn primary" onclick="confirmarImport()" ${ok.length?'':'disabled'}>Lançar ${ok.length} OS</button></div>`;
 }
 window.previewImport = previewImport;
@@ -1293,7 +1316,7 @@ window.confirmarImport = () => {
     const dups = {}; // saldo e frete com o mesmo vencimento viram uma duplicata só
     o.pagamentos.filter(p=>p.destino==='duplicata').forEach(p => { const d = p.venc || o.prazo || o.data; dups[d] = dups[d] || {valor:0, frete:0, formas:new Set()}; dups[d].valor += p.valor - (p.freteParte||0); dups[d].frete += (p.freteParte||0); if (p.forma!=='Duplicata') dups[d].formas.add(p.forma); });
     Object.entries(dups).forEach(([d, v]) => { S.db.duplicatas.push({id:uid('d'), os:k, cliente, entrega:d, valor:r2(v.valor), frete:r2(v.frete), pagamentos:[], obs:`${tag}${v.formas.size?' · previsto: '+[...v.formas].join('/'):''}`, origem:'pdf'}); nD++; });
-    S.db.pedidos.push({id:'os'+k, os:k, data:o.data, cliente, cidade:cap(o.cidade), uf:o.uf, canal:cap(o.canal), vendedor:o.vendedor, prazo:o.prazo, transp:o.transp, itens:o.itens, pecas:o.pecas, produtos:o.produtos, frete:o.frete, desconto:o.desconto, total:o.total, importadoEm:TODAY});
+    S.db.pedidos.push({id:'os'+k, os:k, data:o.data, cliente, cidade:cap(o.cidade), uf:o.uf, canal:cap(o.canal), vendedor:o.vendedor, prazo:o.prazo, transp:o.transp, obs:o.obsOS||'', itens:o.itens, pecas:o.pecas, produtos:o.produtos, frete:o.frete, desconto:o.desconto, total:o.total, importadoEm:TODAY});
     nOS++;
   }
   save(); closeModal();
