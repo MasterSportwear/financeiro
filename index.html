@@ -295,7 +295,7 @@ const LOGT = {envio:'Envio / frete interno', mototaxi:'Moto táxi', combustivel:
 const FORMAS = ['Pix','Dinheiro','Crédito','Débito','Boleto','Transferência'];
 const PAL = ['#3987e5','#d95926','#199e70','#c98500','#d55181','#008300','#9085e9','#e66767']; // categórica validada (tema escuro)
 const C = {rec:'#d95926', desp:'#3987e5', good:'#2ecc71', bad:'#e74c3c', warn:'#f0c040', text:'#e8eaf0', grid:'#232a38', muted:'#7d879c'};
-const MOD_KEYS = ['compras','logistica','pagar','duplicatas','cartao','receitas','extrato'];
+const MOD_KEYS = ['pedidos','compras','logistica','pagar','duplicatas','cartao','receitas','extrato'];
 
 // ---------- utilidades ----------
 const $ = s => document.querySelector(s);
@@ -327,7 +327,7 @@ const MCFG = window.MASTER_CONFIG || {};
 const ONLINE = !!(MCFG.supabaseUrl && MCFG.supabaseAnonKey && !/COLE_AQUI/.test(MCFG.supabaseUrl+MCFG.supabaseAnonKey));
 const LS_KEY = 'masterSportwear.financeiro.v1';
 function defaultCfg(){
-  return { empresa:'Master Sportwear', saldoInicial:{}, prazoDup:15, metaReceita:130000, metaMargem:0.15,
+  return { empresa:'Master Sportwear', saldoInicial:{}, prazoDup:15, metaReceita:130000, metaMargem:0.15, receitaPor:'venda',
     taxas:{ Stone:{debito:1.0, credito1:2.99, credito2_6:3.49, credito7_12:3.49, pix:1.99},
             Asaas:{debito:1.89, credito1:2.49, credito2_6:2.49, credito7_12:2.49, pix:1.99} } };
 }
@@ -365,10 +365,10 @@ function savePill(){
 function yearsAvailable(){
   const ys = new Set([new Date().getFullYear()]);
   const add = d => { if (d) ys.add(+d.slice(0,4)); };
-  S.db.compras.forEach(r=>add(r.data)); S.db.pagar.forEach(r=>add(r.venc)); S.db.duplicatas.forEach(r=>add(r.entrega)); S.db.receitas.forEach(r=>add(r.data));
+  S.db.compras.forEach(r=>add(r.data)); S.db.pagar.forEach(r=>add(r.venc)); S.db.duplicatas.forEach(r=>add(r.entrega)); S.db.receitas.forEach(r=>add(r.data)); S.db.pedidos.forEach(r=>add(r.data));
   return [...ys].sort();
 }
-function hasData(y){ return S.db.pagar.some(r=>r.venc&&+r.venc.slice(0,4)===y) || S.db.duplicatas.some(r=>+r.entrega.slice(0,4)===y) || S.db.compras.some(r=>+r.data.slice(0,4)===y); }
+function hasData(y){ return S.db.pedidos.some(r=>r.data&&+r.data.slice(0,4)===y) || S.db.pagar.some(r=>r.venc&&+r.venc.slice(0,4)===y) || S.db.duplicatas.some(r=>+r.entrega.slice(0,4)===y) || S.db.compras.some(r=>+r.data.slice(0,4)===y); }
 const UI = { view:'dashboard', year: null, month: 0, tab:{}, q:{}, f:{}, sort:{} };
 function initPeriod(){
   const cy = new Date().getFullYear(); const withData = yearsAvailable().filter(hasData);
@@ -415,15 +415,30 @@ function cardDatas(r){
 const tagFor = s => ({'Recebido':'good','Pago':'good','Parcial':'warn','Em aberto':'info','A vencer':'info','Próx. 7 dias':'warn','Vence hoje':'warn','Vencido':'bad'}[s] || 'neutral');
 
 // ---------- DRE ----------
+// ---------- Regime de competência ----------
+// Contas a pagar: mês de competência (fato gerador); se não informado, mês do vencimento
+const cpComp = r => r.competencia || (r.venc ? r.venc.slice(0,7) : null);
+// Pedidos (OS): a receita nasce na data da venda (ou na entrega, conforme Configurações)
+const pedAtivos = () => S.db.pedidos.filter(p => p.status !== 'cancelado' && (+p.total||0) > 0);
+const pedComp = p => (S.cfg.receitaPor === 'entrega' && p.prazo) ? p.prazo : p.data;
+const pedFat = p => r2((+p.total||0) - (+p.frete||0));
+const pedRecebido = p => { const k = String(p.os); return r2(sum(S.db.receitas.filter(r=>String(r.osRef||'')===k), r=>r.valor) + sum(S.db.duplicatas.filter(d=>String(d.os)===k), dupRec)); };
+const pedAReceber = p => { const k = String(p.os); return r2(sum(S.db.duplicatas.filter(d=>String(d.os)===k), dupSaldo)); };
+function pedStatus(p){ if (p.status==='cancelado') return 'Cancelado'; const plano = r2(sum(S.db.receitas.filter(r=>String(r.osRef||'')===String(p.os)), r=>r.valor) + sum(S.db.duplicatas.filter(d=>String(d.os)===String(p.os)), dupTotal));
+  if (Math.abs(plano - (+p.total||0)) > 0.05) return 'Sem plano de pagamento'; return pedAReceber(p) > 0.01 ? 'Em aberto' : 'Quitado'; }
+const osComPedido = () => new Set(S.db.pedidos.map(p => String(p.os)));
 function computeDRE(year){
   const db = S.db, m = (rows,d,v,f) => monthly(rows,d,v,f,year);
-  const cpBy = f => m(db.pagar, 'venc', cpEfetivo, r => f(r));
-  const L = {};
-  L.vendas = m(db.receitas,'data',r=>r.valor-(+r.frete||0), r=>r.tipo==='venda');
-  L.duplic = m(db.duplicatas,'entrega',r=>r.valor);
-  L.fretes = add(m(db.duplicatas,'entrega',r=>r.frete), m(db.receitas,'data',r=>+r.frete||0, r=>r.tipo==='venda'));
+  const cpBy = f => m(db.pagar, cpComp, cpEfetivo, r => f(r));
+  const L = {}; const OS = osComPedido(); const ped = pedAtivos();
+  // sinais e duplicatas de OS que têm pedido são só RECEBIMENTO (caixa): a receita já está no pedido
+  const semPed = r => !OS.has(String(r.osRef || r.os || ''));
+  L.pedidos = m(ped, pedComp, pedFat);
+  L.vendas = m(db.receitas,'data',r=>r.valor-(+r.frete||0), r=>r.tipo==='venda' && semPed(r));
+  L.duplic = m(db.duplicatas,r=>r.competencia||r.entrega,r=>r.valor, semPed);
+  L.fretes = add(m(ped, pedComp, p=>+p.frete||0), m(db.duplicatas,r=>r.competencia||r.entrega,r=>r.frete, semPed), m(db.receitas,'data',r=>+r.frete||0, r=>r.tipo==='venda' && semPed(r)));
   L.outras = m(db.receitas,'data',r=>r.valor, r=>r.tipo!=='venda');
-  L.receita = add(L.vendas,L.duplic,L.fretes,L.outras);
+  L.receita = add(L.pedidos,L.vendas,L.duplic,L.fretes,L.outras);
   L.impostos = cpBy(r => (PLANO[r.categoria]||{}).g==='impostos');
   L.taxas = m(db.cartao,'data',cardTaxaValor);
   L.deducoes = add(L.impostos,L.taxas);
@@ -437,7 +452,7 @@ function computeDRE(year){
   L.fixCat = {}; ['pessoal','prolabore','ocupacao','admin','comercial','acordos'].forEach(g => L.fixCat[g] = cpBy(r => (PLANO[r.categoria]||{}).g===g));
   L.fixas = add(...Object.values(L.fixCat));
   L.ebitda = sub(L.mc,L.fixas);
-  L.financ = m(db.pagar,'venc',r=>(+r.juros||0)+(+r.multa||0), r=>r.status==='pago');
+  L.financ = m(db.pagar,cpComp,r=>(+r.juros||0)+(+r.multa||0), r=>r.status==='pago');
   L.resultado = sub(L.ebitda,L.financ);
   L.emprest = cpBy(r => (PLANO[r.categoria]||{}).g==='financiamento');
   L.invest = cpBy(r => (PLANO[r.categoria]||{}).g==='investimento');
@@ -530,9 +545,9 @@ const optPlano = () => Object.entries(PLANO).map(([k,v]) => ({v:k, l:`${v.n} —
 const MODS = {
   receitas: {
     title:'Vendas & Entradas', icon:'💰', dateKey:'data', single:'entrada',
-    sub:'Sinais de pedidos, vendas à vista e varejo, e outras receitas. Junto com as <b>duplicatas</b>, formam a receita bruta da DRE.',
+    sub:'Dinheiro que <b>entrou</b>: sinais de OS, vendas à vista e varejo, e outras receitas. Sinais de OS cadastradas em <b>Pedidos</b> contam só no caixa — a receita (competência) vem do pedido.',
     fields:[{k:'data',l:'Data',t:'date',req:1},{k:'tipo',l:'Tipo',t:'select',o:[{v:'venda',l:'Venda (sinal / à vista / varejo)'},{v:'outras',l:'Outras receitas'}],req:1},
-      {k:'descricao',l:'Descrição / OS / cliente',t:'text',full:1,req:1},{k:'forma',l:'Forma de recebimento',t:'select',o:FORMAS.concat(['Diversos'])},{k:'valor',l:'Valor (R$)',t:'money',req:1},{k:'obs',l:'Observação',t:'text',full:1}],
+      {k:'descricao',l:'Descrição / cliente',t:'text',full:1,req:1},{k:'osRef',l:'Nº da OS (se houver)',t:'text',hint:'Se a OS estiver em Pedidos, este valor conta só como recebimento — a receita já está no pedido.'},{k:'forma',l:'Forma de recebimento',t:'select',o:FORMAS.concat(['Diversos'])},{k:'valor',l:'Valor (R$)',t:'money',req:1},{k:'obs',l:'Observação',t:'text',full:1}],
     cols:[{k:'data',l:'Data',f:fdate},{k:'tipo',l:'Tipo',r:r=>`<span class="tag ${r.tipo==='venda'?'info':'neutral'}">${r.tipo==='venda'?'Venda':'Outras'}</span>`},{k:'descricao',l:'Descrição'},{k:'forma',l:'Forma'},{k:'valor',l:'Valor',num:1,f:money,tot:1},{k:'obs',l:'Obs.',cls:'muted'}],
     filters:[{k:'tipo',l:'Tipo',o:[{v:'venda',l:'Vendas'},{v:'outras',l:'Outras'}]}],
     defaults:()=>({data:TODAY,tipo:'venda',forma:'Pix'}),
@@ -540,6 +555,28 @@ const MODS = {
     kpis(rows){ const v=sum(rows.filter(r=>r.tipo==='venda'),r=>r.valor), o=sum(rows.filter(r=>r.tipo!=='venda'),r=>r.valor);
       return [kpi('Total de entradas', kmoney(v+o),`${rows.length} lançamento(s)`,'t-green'),kpi('Vendas (sinal / à vista)', kmoney(v),pct(v/((v+o)||1))+' do total','t-blue'),kpi('Outras receitas', kmoney(o),'','t-gray')]; },
     chart:'mensal'
+  },
+  pedidos: {
+    title:'Pedidos / Faturamento (OS)', icon:'📦', dateKey:'data', single:'pedido', novo:'Novo',
+    sub:'Cada OS vendida é o <b>fato gerador da receita</b> (regime de competência): entra na DRE na data da venda. Sinais, duplicatas e cartões da mesma OS são só o <b>recebimento</b> (caixa).',
+    fields:[{k:'os',l:'Nº da OS',t:'text',req:1},{k:'data',l:'Data da venda',t:'date',req:1},{k:'cliente',l:'Cliente',t:'text',full:1},
+      {k:'canal',l:'Canal',t:'text',list:()=>[...new Set(S.db.pedidos.map(p=>p.canal).filter(Boolean))]},{k:'vendedor',l:'Vendedor(a)',t:'text',list:()=>[...new Set(S.db.pedidos.map(p=>p.vendedor).filter(Boolean))]},
+      {k:'prazo',l:'Prazo de entrega',t:'date'},{k:'pecas',l:'Nº de peças',t:'num'},{k:'produtos',l:'Produtos / serviços (R$)',t:'money'},{k:'desconto',l:'Desconto (R$)',t:'money'},
+      {k:'frete',l:'Frete cobrado (R$)',t:'money'},{k:'total',l:'Total do pedido (R$)',t:'money',hint:'Em branco = produtos − desconto + frete'},
+      {k:'status',l:'Situação',t:'select',o:[{v:'ativo',l:'Ativo'},{v:'cancelado',l:'Cancelado (sai da DRE)'}]},{k:'obs',l:'Observação',t:'text'}],
+    cols:[{k:'os',l:'OS',cls:'mono'},{k:'data',l:'Venda',f:fdate},{k:'cliente',l:'Cliente'},{k:'canal',l:'Canal',cls:'t2'},{k:'vendedor',l:'Vendedor(a)',cls:'t2'},{k:'pecas',l:'Peças',num:1,f:num},
+      {k:'_fat',l:'Faturamento',num:1,v:r=>r.status==='cancelado'?0:pedFat(r),f:money,tot:1},{k:'frete',l:'Frete',num:1,f:v=>v?money(v):'',tot:1},
+      {k:'_rec',l:'Recebido',num:1,v:pedRecebido,f:money,tot:1},{k:'_ab',l:'A receber',num:1,v:pedAReceber,f:v=>v>0.01?`<b>${money(v)}</b>`:'<span class="muted">—</span>',tot:1},
+      {k:'_st',l:'Situação',v:pedStatus,r:r=>`<span class="tag ${{'Quitado':'good','Em aberto':'info','Cancelado':'neutral','Sem plano de pagamento':'warn'}[pedStatus(r)]}">${pedStatus(r)}</span>`}],
+    filters:[{k:'_st',l:'Situação',o:['Em aberto','Quitado','Sem plano de pagamento','Cancelado'],fn:(r,v)=>pedStatus(r)===v},{k:'canal',l:'Canal',o:()=>[...new Set(S.db.pedidos.map(p=>p.canal).filter(Boolean))].sort()},{k:'vendedor',l:'Vendedor(a)',o:()=>[...new Set(S.db.pedidos.map(p=>p.vendedor).filter(Boolean))].sort()}],
+    defaults:()=>({data:TODAY,status:'ativo',frete:0,desconto:0}),
+    extraActions:()=>`<button class="btn" onclick="importarOS()" title="Lê o PDF da ordem de serviço (avulsa ou em lote)">📄 Importar OS (PDF)</button>`,
+    compute(r){ r.status = r.status || 'ativo'; if (!+r.total) r.total = r2((+r.produtos||0) - (+r.desconto||0) + (+r.frete||0)); if (!+r.produtos) r.produtos = r2((+r.total||0) - (+r.frete||0) + (+r.desconto||0)); },
+    kpis(rows){ const at = rows.filter(r=>r.status!=='cancelado'), fat = sum(at,pedFat), ab = sum(at,pedAReceber), np = at.length;
+      return [kpi('Faturamento (competência)', kmoney(fat), `${np} pedido(s) · ${periodLabel()}`,'t-green'), kpi('Ticket médio', money(fat/(np||1)), `${num(sum(at,r=>+r.pecas||0))} peças`,'t-blue'),
+        kpi('Recebido destes pedidos', kmoney(sum(at,pedRecebido)), 'sinais + duplicatas pagas', 't-gray'), kpi('A receber destes pedidos', kmoney(ab), `${at.filter(r=>pedAReceber(r)>0.01).length} OS com saldo`, 't-yellow'),
+        kpi('Cancelados', String(rows.length - np), money(sum(rows.filter(r=>r.status==='cancelado'),r=>+r.total||0)), 't-red')]; },
+    chart:'pedidos'
   },
   duplicatas: {
     title:'Duplicatas a Receber', icon:'🧾', dateKey:'entrega', single:'duplicata',
@@ -584,16 +621,16 @@ const MODS = {
     title:'Contas a Pagar', icon:'📌', dateKey:'venc', single:'conta',
     sub:'Despesas fixas e compromissos, classificados no <b>plano de contas</b> que alimenta DRE, balancete e fluxo de caixa.',
     fields:[{k:'fornecedor',l:'Fornecedor',t:'text',req:1,list:()=>[...new Set(S.db.pagar.map(r=>r.fornecedor))]},{k:'descricao',l:'Descrição',t:'text',req:1},
-      {k:'categoria',l:'Categoria (plano de contas)',t:'select',o:optPlano,full:1,req:1},{k:'valor',l:'Valor previsto (R$)',t:'money',req:1},{k:'venc',l:'Vencimento',t:'date',req:1},
+      {k:'categoria',l:'Categoria (plano de contas)',t:'select',o:optPlano,full:1,req:1},{k:'valor',l:'Valor previsto (R$)',t:'money',req:1},{k:'venc',l:'Vencimento',t:'date',req:1},{k:'competencia',l:'Competência (mês da despesa)',t:'month',hint:'Mês a que a despesa se refere (ex.: folha de setembro paga em outubro = setembro). Em branco = mês do vencimento.'},
       {k:'status',l:'Situação',t:'select',o:[{v:'aberto',l:'Em aberto'},{v:'pago',l:'Pago'}]},{k:'dataPg',l:'Data do pagamento',t:'date'},{k:'juros',l:'Juros (R$)',t:'money'},{k:'multa',l:'Multa (R$)',t:'money'},
       {k:'valorPago',l:'Valor pago (R$)',t:'money',hint:'Em branco = valor + juros + multa'},{k:'fonte',l:'Fonte de pagamento',t:'text',list:()=>[...new Set(S.db.pagar.map(r=>r.fonte).filter(Boolean))]},{k:'obs',l:'Observação',t:'text',full:1}],
-    cols:[{k:'venc',l:'Vencimento',f:fdate},{k:'fornecedor',l:'Fornecedor'},{k:'descricao',l:'Descrição',cls:'t2'},{k:'categoria',l:'Categoria',v:r=>(PLANO[r.categoria]||{}).n||r.categoria,r:r=>`<span class="tag neutral">${esc((PLANO[r.categoria]||{}).n||r.categoria)}</span>`},
+    cols:[{k:'venc',l:'Vencimento',f:fdate},{k:'_comp',l:'Compet.',v:cpComp,f:v=>v?`<span class="muted mono" style="font-size:11.5px">${v.slice(5,7)}/${v.slice(0,4)}</span>`:''},{k:'fornecedor',l:'Fornecedor'},{k:'descricao',l:'Descrição',cls:'t2'},{k:'categoria',l:'Categoria',v:r=>(PLANO[r.categoria]||{}).n||r.categoria,r:r=>`<span class="tag neutral">${esc((PLANO[r.categoria]||{}).n||r.categoria)}</span>`},
       {k:'valor',l:'Previsto',num:1,f:money,tot:1},{k:'valorPago',l:'Pago',num:1,f:v=>v?money(v):'<span class="muted">—</span>',tot:1},{k:'dataPg',l:'Pago em',r:r=>r.dataPg?`${fdate(r.dataPg)}${r.fonte?`<div class="muted" style="font-size:11px">${esc(r.fonte)}</div>`:''}`:''},
       {k:'_st',l:'Situação',v:cpStatus,r:r=>`<span class="tag ${tagFor(cpStatus(r))}">${cpStatus(r)}</span>`}],
     filters:[{k:'_st',l:'Situação',o:['A vencer','Próx. 7 dias','Vence hoje','Vencido','Pago'],fn:(r,v)=>cpStatus(r)===v},{k:'_g',l:'Grupo',o:()=>Object.entries(GRUPOS).map(([v,l])=>({v,l})),fn:(r,v)=>(PLANO[r.categoria]||{}).g===v},
       {k:'categoria',l:'Categoria',o:optPlano}],
     defaults:()=>({venc:TODAY,status:'aberto',categoria:'gerais',juros:0,multa:0}),
-    compute(r){ if (r.status==='pago'){ r.dataPg = r.dataPg || TODAY; if (!+r.valorPago) r.valorPago = r2((+r.valor||0)+(+r.juros||0)+(+r.multa||0)); } else { r.valorPago = 0; r.dataPg = null; } },
+    compute(r){ if (!r.competencia && r.venc) r.competencia = r.venc.slice(0,7); if (r.status==='pago'){ r.dataPg = r.dataPg || TODAY; if (!+r.valorPago) r.valorPago = r2((+r.valor||0)+(+r.juros||0)+(+r.multa||0)); } else { r.valorPago = 0; r.dataPg = null; } },
     actions:[{i:'💸',t:'Registrar pagamento hoje',show:r=>r.status!=='pago',run:r=>{ r.status='pago'; r.dataPg=TODAY; r.valorPago=r2((+r.valor||0)+(+r.juros||0)+(+r.multa||0)); save(); toast(`${r.fornecedor}: pagamento registrado.`); render(); }}],
     extraActions:()=>`<button class="btn" onclick="recorrencia()" title="Copia as contas do mês selecionado para o mês seguinte, em aberto">↻ Gerar próximo mês</button>`,
     kpis(rows){
@@ -697,6 +734,13 @@ function moduleCharts(key, rows){
   const side = (t, html) => { $('#msT').textContent = t; $('#msB').innerHTML = html; };
   const filtTab = r => !M.tabKey || !UI.tab[key] || UI.tab[key]==='all' || r[M.tabKey]===UI.tab[key];
   const top = (arr, kf, vf, n=8) => { const m = {}; arr.forEach(r => { const k = kf(r) || '(não informado)'; m[k] = (m[k]||0) + (+vf(r)||0); }); return Object.entries(m).map(([l,v])=>({l,v})).sort((a,b)=>b.v-a.v).slice(0,n); };
+  if (M.chart === 'pedidos'){
+    const fat = monthly(pedAtivos(), pedComp, pedFat);
+    T('Faturamento por mês (competência)', `${UI.year} · ${S.cfg.receitaPor==='entrega'?'pela data de entrega':'pela data da venda'}`);
+    chart('mc', {type:'bar', data:{labels:MES3, datasets:[barDs('Faturamento', fat, fat.map((_,i)=>!UI.month||UI.month===i+1?C.rec:'#5a3226'))]}, options:{scales:{y:yMoney,x:xCat}}});
+    const at = rows.filter(r=>r.status!=='cancelado');
+    side('Por canal e vendedor(a)', `<div class="t2" style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:0 0 2px">Por canal</div>${hbars(top(at,p=>p.canal||'Não informado',pedFat,5),C.rec)}<div class="t2" style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:10px 0 2px">Por vendedor(a)</div>${hbars(top(at,p=>p.vendedor||'Não informado',pedFat,5),C.desp)}`);
+  }
   if (M.chart === 'mensal' || M.chart === 'categorias'){
     const vf = key==='receitas'||key==='extrato'||key==='logistica' ? r=>r.valor : r=>r.total;
     const data = monthly(S.db[key], M.dateKey, vf, filtTab);
@@ -728,8 +772,8 @@ function moduleCharts(key, rows){
   }
   if (M.chart === 'grupos'){
     const base = S.db.pagar; const gs = [['Pessoal e encargos',['pessoal']],['Pró-labore',['prolabore']],['Ocupação e utilidades',['ocupacao']],['Administrativas e sistemas',['admin']],['Marketing',['comercial']],['Impostos e acordos',['impostos','acordos']],['Máquinas',['investimento']],['Empréstimos',['financiamento']]];
-    const ds = gs.map(([l,g],i)=>barDs(l, monthly(base,'venc',cpEfetivo,r=>g.includes((PLANO[r.categoria]||{}).g)), PAL[i], {stack:'s', borderRadius:2, borderColor:'#181c27', borderWidth:{top:1}})).filter(d=>sum(d.data)>0);
-    T('Despesas por grupo, mês a mês', `${UI.year} · competência (vencimento)`);
+    const ds = gs.map(([l,g],i)=>barDs(l, monthly(base,cpComp,cpEfetivo,r=>g.includes((PLANO[r.categoria]||{}).g)), PAL[i], {stack:'s', borderRadius:2, borderColor:'#181c27', borderWidth:{top:1}})).filter(d=>sum(d.data)>0);
+    T('Despesas por grupo, mês a mês', `${UI.year} · competência (mês da despesa)`);
     $('#mcL').innerHTML = legendHTML(ds.map(d=>[d.backgroundColor,d.label]));
     chart('mc', {type:'bar', data:{labels:MES3, datasets:ds}, options:{scales:{y:{...yMoney,stacked:true},x:{...xCat,stacked:true}}}});
     side('Maiores contas do período', hbars(top(rows, r=>(PLANO[r.categoria]||{}).n||r.categoria, cpEfetivo, 9), C.desp));
@@ -757,7 +801,14 @@ window.setFilter = (k,f,v) => { UI.f[k] = UI.f[k]||{}; UI.f[k][f] = v; render();
 let qTimer; window.setQ = (k,v) => { UI.q[k] = v; clearTimeout(qTimer); qTimer = setTimeout(()=>{ render(); const el = $('#q_'+k); if (el){ el.focus(); el.setSelectionRange(v.length,v.length); } }, 220); };
 window.setSort = (k,c) => { const s = UI.sort[k]; UI.sort[k] = {k:c, d: s && s.k===c ? -s.d : (c===MODS[k].dateKey?-1:1)}; render(); };
 window.rowAction = (k,id,i) => { const r = S.db[k].find(x=>x.id===id); if (r) MODS[k].actions[i].run(r); };
-window.delRow = (k,id) => { const r = S.db[k].find(x=>x.id===id); confirmBox('Excluir lançamento', `Excluir este registro de <b>${MODS[k].title}</b>?${k==='receitas'&&r&&r.cartaoId?' A venda no cartão vinculada a este sinal também será excluída.':''} Esta ação não pode ser desfeita (a não ser restaurando um backup).`, 'Excluir', () => { S.db[k] = S.db[k].filter(x=>x.id!==id); if (k==='receitas' && r && r.cartaoId) S.db.cartao = S.db.cartao.filter(c=>c.id!==r.cartaoId); if (k==='duplicatas' && r){ const ks = (r.pagamentos||[]).map(p=>p.cartaoId).filter(Boolean); S.db.cartao = S.db.cartao.filter(c=>!ks.includes(c.id)); } save(); toast('Lançamento excluído.'); render(); }); };
+window.delRow = (k,id) => { const r = S.db[k].find(x=>x.id===id);
+  if (k==='pedidos' && r){ const os = String(r.os); const rs = S.db.receitas.filter(x=>String(x.osRef||'')===os), ds = S.db.duplicatas.filter(x=>String(x.os)===os);
+    const ks = new Set([...rs.map(x=>x.cartaoId), ...ds.flatMap(d=>(d.pagamentos||[]).map(p=>p.cartaoId))].filter(Boolean));
+    openModal(`<div class="modal-h"><h3>Excluir pedido OS ${esc(os)}</h3><button class="x" onclick="closeModal()">×</button></div><div class="modal-b" style="display:block"><p class="t2" style="margin-top:0">Esta OS tem <b>${rs.length}</b> sinal(is)/entrada(s), <b>${ds.length}</b> duplicata(s) e <b>${ks.size}</b> venda(s) no cartão vinculados.</p><p class="t2">Se a venda foi <b>cancelada</b>, prefira editar o pedido e marcar a situação como “Cancelado”: ele sai da DRE e o histórico fica guardado.</p></div>
+      <div class="modal-f"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn" id="dpSo">Excluir só o pedido</button><button class="btn danger" id="dpTudo">Excluir pedido e lançamentos</button></div>`, true);
+    $('#dpSo').onclick = () => { S.db.pedidos = S.db.pedidos.filter(x=>x.id!==id); save(); closeModal(); toast('Pedido excluído.'); render(); };
+    $('#dpTudo').onclick = () => { S.db.pedidos = S.db.pedidos.filter(x=>x.id!==id); S.db.receitas = S.db.receitas.filter(x=>String(x.osRef||'')!==os); S.db.duplicatas = S.db.duplicatas.filter(x=>String(x.os)!==os); S.db.cartao = S.db.cartao.filter(c=>!ks.has(c.id)); save(); closeModal(); toast(`OS ${os}: pedido e lançamentos excluídos.`); render(); };
+    return; } confirmBox('Excluir lançamento', `Excluir este registro de <b>${MODS[k].title}</b>?${k==='receitas'&&r&&r.cartaoId?' A venda no cartão vinculada a este sinal também será excluída.':''} Esta ação não pode ser desfeita (a não ser restaurando um backup).`, 'Excluir', () => { S.db[k] = S.db[k].filter(x=>x.id!==id); if (k==='receitas' && r && r.cartaoId) S.db.cartao = S.db.cartao.filter(c=>c.id!==r.cartaoId); if (k==='duplicatas' && r){ const ks = (r.pagamentos||[]).map(p=>p.cartaoId).filter(Boolean); S.db.cartao = S.db.cartao.filter(c=>!ks.includes(c.id)); } save(); toast('Lançamento excluído.'); render(); }); };
 window.dupRow = (k,id) => { const r = S.db[k].find(x=>x.id===id); if (!r) return; const c = JSON.parse(JSON.stringify(r)); delete c.id; delete c.cartaoId; if (k==='duplicatas') c.pagamentos = []; editRow(k, null, c); };
 window.editRow = (k, id, preset) => {
   const M = MODS[k]; const cur = id ? S.db[k].find(x=>x.id===id) : null; const r = cur ? {...cur} : {...M.defaults(), ...(preset||{})};
@@ -765,7 +816,7 @@ window.editRow = (k, id, preset) => {
     const v = r[f.k] ?? ''; const req = f.req ? ' required' : ''; let input;
     if (f.t==='select') input = `<select id="f_${f.k}"${req}>${optsOf(f.o).map(o=>`<option value="${esc(o.v)}" ${String(v)===String(o.v)?'selected':''}>${esc(o.l)}</option>`).join('')}</select>`;
     else if (f.t==='textarea') input = `<textarea id="f_${f.k}">${esc(v)}</textarea>`;
-    else { const type = f.t==='date'?'date':(f.t==='money'||f.t==='num')?'number':'text'; const step = f.t==='money'?' step="0.01"':f.t==='num'?' step="any"':'';
+    else { const type = f.t==='date'?'date':f.t==='month'?'month':(f.t==='money'||f.t==='num')?'number':'text'; const step = f.t==='money'?' step="0.01"':f.t==='num'?' step="any"':'';
       let list = ''; if (f.list){ list = ` list="dl_${f.k}"`; lists.push(`<datalist id="dl_${f.k}">${f.list().slice(0,400).map(o=>`<option value="${esc(o)}">`).join('')}</datalist>`); }
       input = `<input id="f_${f.k}" type="${type}"${step}${req}${list} value="${esc(v)}" ${f.t==='money'?'inputmode="decimal"':''}>`; }
     return `<div class="fld ${f.full?'full':''}"><label for="f_${f.k}">${f.l}${f.req?' *':''}</label>${input}${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
@@ -784,7 +835,7 @@ window.editRow = (k, id, preset) => {
   if (k==='compras') $('#f_cat').addEventListener('change', e => { $('#f_unid').value = COMPRAS[e.target.value].u; });
   $('#frm').onsubmit = e => {
     e.preventDefault(); const o = cur ? cur : {id: uid(k[0])};
-    for (const f of M.fields){ let v = $('#f_'+f.k).value; if (f.t==='money'||f.t==='num') v = v==='' ? (f.k==='taxa'?'':null) : +v; else if (f.t==='date') v = v || null; else v = v.trim(); o[f.k] = v; }
+    for (const f of M.fields){ let v = $('#f_'+f.k).value; if (f.t==='money'||f.t==='num') v = v==='' ? (f.k==='taxa'?'':null) : +v; else if (f.t==='date' || f.t==='month') v = v || null; else v = v.trim(); o[f.k] = v; }
     if (M.compute) M.compute(o);
     if (k==='compras' && !+o.total){ toast('Informe o valor total ou quantidade × preço.', true); return; }
     if (!cur) S.db[k].push(o);
@@ -797,7 +848,7 @@ window.recorrencia = () => {
   if (!UI.month){ toast('Selecione um mês no topo para gerar as contas do mês seguinte.', true); return; }
   const src = S.db.pagar.filter(r => inPeriod(r.venc)); const ny = UI.month===12 ? UI.year+1 : UI.year, nm = UI.month===12 ? 1 : UI.month+1;
   confirmBox('Gerar contas do próximo mês', `Copiar <b>${src.length}</b> conta(s) de ${MESES[UI.month-1]}/${UI.year} para <b>${MESES[nm-1]}/${ny}</b>, em aberto, com os mesmos valores previstos? Depois é só ajustar ou excluir o que não se repete (parcelas, acordos).`, 'Gerar contas', () => {
-    src.forEach(r => S.db.pagar.push({...r, id:uid('p'), venc:addMonths(r.venc,1), status:'aberto', dataPg:null, valorPago:0, juros:0, multa:0, obs:'Gerada por recorrência'}));
+    src.forEach(r => S.db.pagar.push({...r, id:uid('p'), venc:addMonths(r.venc,1), competencia:addMonths((cpComp(r)||r.venc.slice(0,7))+'-01',1).slice(0,7), status:'aberto', dataPg:null, valorPago:0, juros:0, multa:0, obs:'Gerada por recorrência'}));
     save(); UI.year = ny; UI.month = nm; fillPeriod(); toast(`${src.length} contas geradas para ${MESES[nm-1]}/${ny}.`); render();
   }, false);
 };
@@ -926,7 +977,7 @@ function renderDRE(){
   const d = computeDRE(UI.year); const R = d.receita;
   const rows = [
     {sec:'Receita'},
-    {l:'Vendas (sinais, à vista e varejo)',v:d.vendas,ind:1},{l:'Duplicatas faturadas (saldo na entrega)',v:d.duplic,ind:1},{l:'Fretes cobrados',v:d.fretes,ind:1},{l:'Outras receitas',v:d.outras,ind:1},
+    {l:'Pedidos faturados (OS) — data da venda',v:d.pedidos,ind:1},{l:'Vendas sem OS (à vista, varejo, consolidados)',v:d.vendas,ind:1},{l:'Duplicatas sem OS (lançamentos manuais / 2025)',v:d.duplic,ind:1},{l:'Fretes cobrados',v:d.fretes,ind:1},{l:'Outras receitas',v:d.outras,ind:1},
     {l:'(=) RECEITA BRUTA',v:R,cls:'sub'},
     {l:'(−) Impostos sobre vendas (Simples)',v:d.impostos,ind:1,neg:1},{l:'(−) Taxas de cartão',v:d.taxas,ind:1,neg:1},
     {l:'(=) RECEITA LÍQUIDA',v:d.liquida,cls:'sub'},
@@ -946,10 +997,10 @@ function renderDRE(){
     {l:'(=) RESULTADO APÓS INVESTIMENTOS E DÍVIDAS',v:d.posInv,cls:'sub'}
   ];
   const res = pick(d.resultado), rec = pick(R);
-  $('#view').innerHTML = pageHead('DRE — Demonstração do Resultado', `Apurada automaticamente pelo regime de competência a partir de vendas, duplicatas, compras, logística, cartões e contas a pagar. <b>${UI.year}</b>, mês a mês.`,
+  $('#view').innerHTML = pageHead('DRE — Demonstração do Resultado', `Regime de competência: receitas pelo fato gerador (data da venda da OS) e despesas pelo mês a que se referem — independentemente de quando foram recebidas ou pagas. <b>${UI.year}</b>, mês a mês.`,
       `<button class="btn" onclick="exportTable('DRE')">⬇ Excel</button><button class="btn" onclick="window.print()">🖨 Imprimir</button>`)
     + `<div class="kpis">${kpi('Receita bruta', kmoney(rec),periodLabel(),'t-green')}${kpi('Lucro bruto', kmoney(pick(d.bruto)),'margem '+pct(pick(d.bruto)/(rec||1)),'t-blue')}${kpi('Margem de contribuição', kmoney(pick(d.mc)),pct(pick(d.mc)/(rec||1))+' da receita','t-yellow')}${kpi('Resultado líquido',`<span class="${res<0?'neg':''}">${kmoney(res)}</span>`,'margem '+pct(res/(rec||1)),res<0?'t-red':'t-green')}${kpi('Após dívidas e investimentos', kmoney(pick(d.posInv)),'o que sobra para o caixa','t-gray')}</div>`
-    + `<div class="panel">${repTable(rows,{av:1,avBase:R})}<div class="note"><b>Como ler:</b> AV % = análise vertical sobre a receita bruta do ano. Contas a pagar entram pelo mês de <b>vencimento</b> (competência) e pelo valor efetivamente pago, sem juros/multa (que vão para despesas financeiras). Empréstimos e máquinas não são despesa do período — aparecem abaixo do resultado porque consomem caixa.</div></div>`;
+    + `<div class="panel">${repTable(rows,{av:1,avBase:R})}<div class="note"><b>Regime de competência:</b> a receita de cada OS entra na data da <b>venda</b>${S.cfg.receitaPor==='entrega'?' (configurado: data de <b>entrega</b>)':''}, não na data do recebimento — sinais, duplicatas e cartões da OS são apenas caixa (veja o Fluxo de Caixa). Vendas sem OS cadastrada entram pela data do lançamento. Contas a pagar entram pelo <b>mês de competência</b> (fato gerador), compras pela data da compra. AV % = análise vertical sobre a receita bruta do ano. Contas a pagar entram pelo valor efetivamente pago, sem juros/multa (que vão para despesas financeiras). Empréstimos e máquinas não são despesa do período — aparecem abaixo do resultado porque consomem caixa.</div></div>`;
 }
 function renderFC(){
   const F = computeFC(UI.year);
@@ -983,10 +1034,10 @@ function renderFC(){
 }
 function renderBalancete(){
   const y = UI.year; const db = S.db;
-  const fixRows = Object.entries(PLANO).map(([k,p])=>({l:p.n, g:p.g, v:monthly(db.pagar,'venc',cpEfetivo,r=>r.categoria===k,y)})).filter(r=>sum(r.v));
+  const fixRows = Object.entries(PLANO).map(([k,p])=>({l:p.n, g:p.g, v:monthly(db.pagar,cpComp,cpEfetivo,r=>r.categoria===k,y)})).filter(r=>sum(r.v));
   const varRows = [...Object.keys(COMPRAS).map(k=>({l:COMPRAS[k].n, v:monthly(db.compras,'data',r=>r.total,r=>r.cat===k,y)})),
     ...Object.keys(LOGT).map(k=>({l:LOGT[k], v:monthly(db.logistica,'data',r=>r.valor,r=>r.tipo===k,y)})),
-    {l:'Taxas de cartão', v:monthly(db.cartao,'data',cardTaxaValor,null,y)}, {l:'Juros e multas pagos', v:monthly(db.pagar,'venc',r=>(+r.juros||0)+(+r.multa||0),r=>r.status==='pago',y)}].filter(r=>sum(r.v));
+    {l:'Taxas de cartão', v:monthly(db.cartao,'data',cardTaxaValor,null,y)}, {l:'Juros e multas pagos', v:monthly(db.pagar,cpComp,r=>(+r.juros||0)+(+r.multa||0),r=>r.status==='pago',y)}].filter(r=>sum(r.v));
   const tf = add(...fixRows.map(r=>r.v).concat([Array(12).fill(0)])), tv = add(...varRows.map(r=>r.v).concat([Array(12).fill(0)])), tg = add(tf,tv);
   let code = 0; const lab = r => `<span class="muted mono" style="font-size:11px;margin-right:8px">${pad(++code)}</span>${esc(r.l)}`;
   const rows = [{sec:'Gastos fixos (contas a pagar)'}, ...fixRows.map(r=>({l:lab(r),v:r.v,ind:1})), {l:'TOTAL — DESPESAS FIXAS',v:tf,cls:'sub'},
@@ -1075,6 +1126,7 @@ function renderConfig(){
         <div class="fld"><label>Meta de receita mensal (R$)</label><input type="number" step="100" id="c_meta" value="${c.metaReceita}"></div>
         <div class="fld"><label>Meta de margem líquida (%)</label><input type="number" step="0.5" id="c_mg" value="${(c.metaMargem*100).toFixed(1)}"></div>
         <div class="fld"><label>Prazo médio esperado das duplicatas (dias)</label><input type="number" id="c_pz" value="${c.prazoDup}"></div>
+        <div class="fld"><label>Receita das OS na DRE (competência)</label><select id="c_rp"><option value="venda" ${c.receitaPor!=='entrega'?'selected':''}>Data da venda (emissão da OS)</option><option value="entrega" ${c.receitaPor==='entrega'?'selected':''}>Data de entrega (prazo da OS)</option></select></div>
         ${ys.map(y=>`<div class="fld"><label>Saldo inicial de caixa ${y} (R$)</label><input type="number" step="0.01" data-si="${y}" value="${c.saldoInicial[y]??''}" placeholder="auto: ${money(saldoInicial(y))}"></div>`).join('')}
       </div><div style="margin-top:14px"><button class="btn primary" onclick="saveCfg()">Salvar parâmetros</button></div>
       <div class="muted" style="margin-top:10px;font-size:12px">Saldo inicial em branco = o sistema usa o saldo final calculado do ano anterior.</div></div></div>
@@ -1096,7 +1148,7 @@ function renderConfig(){
   if (ONLINE && typeof cloudConfigLoad==='function') cloudConfigLoad();
 }
 window.saveCfg = () => {
-  const c = S.cfg; c.metaReceita = +$('#c_meta').value||0; c.metaMargem = (+$('#c_mg').value||0)/100; c.prazoDup = +$('#c_pz').value||15;
+  const c = S.cfg; c.metaReceita = +$('#c_meta').value||0; c.metaMargem = (+$('#c_mg').value||0)/100; c.prazoDup = +$('#c_pz').value||15; c.receitaPor = $('#c_rp').value;
   document.querySelectorAll('[data-si]').forEach(i => { const y = i.dataset.si; if (i.value==='') delete c.saldoInicial[y]; else c.saldoInicial[y] = +i.value; });
   document.querySelectorAll('[data-tx]').forEach(i => { const [o,k] = i.dataset.tx.split('|'); c.taxas[o][k] = +i.value||0; });
   save(); toast('Parâmetros salvos.'); render();
@@ -1894,7 +1946,7 @@ window.mudaPapel = async (id, papel) => {
    ===================================================================== */
 const NAV = [
   ['Painel', [['dashboard','📊','Dashboard']]],
-  ['Receitas', [['receitas','💰','Vendas & Entradas'],['duplicatas','🧾','Duplicatas a Receber'],['cartao','💳','Cartões & Recebíveis']]],
+  ['Receitas', [['pedidos','📦','Pedidos / Faturamento'],['receitas','💰','Vendas & Entradas'],['duplicatas','🧾','Duplicatas a Receber'],['cartao','💳','Cartões & Recebíveis']]],
   ['Despesas', [['pagar','📌','Contas a Pagar'],['compras','🧵','Compras de Insumos'],['logistica','🚚','Logística & Fretes']]],
   ['Tesouraria', [['conciliacao','🔄','Conciliação Bancária'],['extrato','🏦','Relatório de Pagamentos']]],
   ['Relatórios', [['dre','📈','DRE'],['fluxo','💧','Fluxo de Caixa'],['balancete','📒','Balancete'],['indicadores','🎯','Indicadores & Análises'],['historico','🗂','Histórico & Comparativo']]],
