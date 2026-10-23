@@ -737,10 +737,10 @@ function moduleCharts(key, rows){
   if (M.chart === 'compras'){
     const cat = UI.tab.compras;
     if (cat && cat!=='all'){
-      const u = COMPRAS[cat]; const q = monthly(S.db.compras,'data',r=>r.qtd,r=>r.cat===cat&&+r.qtd&&(cat!=='tecido'||r.unid==='kg')); const v = monthly(S.db.compras,'data',r=>r.total,r=>r.cat===cat&&+r.qtd&&(cat!=='tecido'||r.unid==='kg'));
-      const pm = q.map((x,i)=>x?r2(v[i]/x):null);
-      T(`Preço médio de ${u.n.toLowerCase()} (${u.pu})`, `${UI.year} · acompanhe reajustes de fornecedor`);
-      chart('mc', {type:'line', data:{labels:MES3, datasets:[{label:u.pu, data:pm, borderColor:C.rec, backgroundColor:C.rec, borderWidth:2, pointRadius:4, pointHoverRadius:6, spanGaps:true, tension:.25}]}, options:{scales:{y:{...yMoney, beginAtZero:false},x:xCat}}});
+      const u = COMPRAS[cat]; const cor = PAL[Object.keys(COMPRAS).indexOf(cat) % PAL.length] || C.rec;
+      const v = monthly(S.db.compras,'data',r=>r.total,r=>r.cat===cat);
+      T(`Total gasto com ${u.n.toLowerCase()}, mês a mês`, `${UI.year} · ${money(sum(v))} no ano${UI.month?' · destaque no mês selecionado':''}`);
+      chart('mc', {type:'bar', data:{labels:MES3, datasets:[barDs(u.n, v, v.map((_,i)=>!UI.month||UI.month===i+1?cor:cor+'55'))]}, options:{scales:{y:yMoney,x:xCat}}});
     } else {
       const ds = Object.keys(COMPRAS).map((k,i)=>barDs(COMPRAS[k].n, monthly(S.db.compras,'data',r=>r.total,r=>r.cat===k), PAL[i], {stack:'s', borderRadius:2, borderColor:'#181c27', borderWidth:{top:1}})).filter(d=>sum(d.data)>0);
       T('Compras por insumo, mês a mês', `${UI.year}`); $('#mcL').innerHTML = legendHTML(ds.map(d=>[d.backgroundColor,d.label]));
@@ -1089,7 +1089,7 @@ function renderConfig(){
           <label class="btn" style="cursor:pointer">⬆ Restaurar backup<input type="file" accept=".json,application/json" style="display:none" onchange="restore(this.files[0])"></label>
           <button class="btn" onclick="exportAll()">⬇ Exportar tudo para Excel</button>
           ${ONLINE?'':`<button class="btn danger" onclick="confirmBox('Restaurar dados de 2025','Substituir todos os lançamentos atuais pelos dados importados das planilhas de 2025? Faça um backup antes se tiver lançado algo novo.','Restaurar',()=>{S=normalize(JSON.parse(JSON.stringify(SEED)));save();toast('Dados de 2025 restaurados.');render();})">↺ Recarregar dados de 2025</button>`}
-          ${ONLINE && (!ME || ME.papel!=='admin') ? '' : `<button class="btn danger" onclick="confirmBox('Apagar todos os lançamentos','Isso remove todos os registros de todos os módulos (as configurações são mantidas). Recomendado apenas para começar um ano do zero após fazer backup.','Apagar tudo',()=>{MOD_KEYS.forEach(k=>S.db[k]=[]);S.db.pedidos=[];save();toast('Lançamentos apagados.');render();})">🗑 Apagar lançamentos</button>`}
+          ${ONLINE && (!ME || ME.papel!=='admin') ? '' : `<button class="btn danger" onclick="confirmBox('Apagar todos os lançamentos','Isso remove todos os registros de todos os módulos (as configurações são mantidas). Recomendado apenas para começar um ano do zero após fazer backup.','Apagar tudo',()=>{MOD_KEYS.forEach(k=>S.db[k]=[]);S.db.pedidos=[];S.db.banco=[];save();toast('Lançamentos apagados.');render();})">🗑 Apagar lançamentos</button>`}
         </div>
         <div class="note" style="margin:14px -16px -14px">${ONLINE?'Restaurar um backup substitui <b>todos</b> os lançamentos do banco pelos do arquivo (para todos os usuários).':'Para usar em mais de um computador: baixe o backup em um e restaure no outro. Para uso simultâneo por vários usuários, use a versão online (Supabase).'}</div>
       </div></div>${ONLINE && typeof cloudConfigHTML==='function' ? cloudConfigHTML() : ''}`;
