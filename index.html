@@ -187,6 +187,8 @@ tfoot td{position:sticky;bottom:0;background:var(--surface-2);font-weight:700;pa
 .imp-meta b{color:var(--text)}
 .imp-warn{font-size:12px;color:var(--warn);background:rgba(240,192,64,.07);border:1px solid rgba(240,192,64,.25);border-radius:8px;padding:7px 10px;margin:6px 0}
 .imp-t select,.imp-t input{height:30px;background:var(--surface);border:1px solid var(--border-2);border-radius:6px;padding:0 6px;color:var(--text)}
+.selbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 16px;background:#241c1e;border-bottom:1px solid #5a3226;font-size:12.5px;position:sticky;top:0;z-index:3}
+tr.sel-row td{background:rgba(245,98,49,.07)}
 .imp-sum{font-size:12.5px;color:var(--text-2);margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .imp-sum b{color:var(--text);font-family:var(--mono)}
 .modal-h{display:flex;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border)}
@@ -1557,11 +1559,14 @@ function renderConciliacao(){
     kpi('Conciliados', pct(pctC,0), `${conc.length} movimento(s)`, pctC>=0.95?'t-green':'t-yellow'),
     kpi('Pendentes no extrato', String(pend.length), `${money(sum(pend,b=>b.valor))} sem lançamento correspondente`, pend.length?'t-red':'t-green'),
     kpi('Lançados sem extrato', String(semExt.length), ini ? `no intervalo ${fdate(ini).slice(0,5)}–${fdate(fim).slice(0,5)} · ${money(sum(semExt,m=>m.valor))}` : '', semExt.length?'t-yellow':'t-green'),
-    kpi('Saldo do extrato no período', money(ent+sai), `sistema conciliado: ${money(sum(conc,b=>sum(b.links,k=>byKey[k]?.valor||0)))}`, 't-gray')].join('');
-  const rowsHTML = linhas.map(b => { const s = bStatus(b); const ls = (b.links||[]).map(k=>byKey[k]).filter(Boolean); const tot = sum(ls,m=>m.valor); const dif = ls.length ? r2(b.valor - tot) : 0;
-    return `<tr><td>${fdate(b.data)}${conta?'':`<div class="muted" style="font-size:11px">${esc(b.conta)}</div>`}</td><td>${esc(b.desc)}</td><td class="num ${b.valor<0?'neg':'pos'}">${money(b.valor)}</td>
+    kpi('Saldo do extrato no período', money(ent+sai), `sistema conciliado: ${money(sum([...new Set(conc.flatMap(b=>b.links||[]))],k=>byKey[k]?.valor||0))}`, 't-gray')].join('');
+  const SEL = new Set((window._bSel||[]).filter(id => S.db.banco.some(b=>b.id===id && bStatus(b)==='Pendente'))); window._bSel = [...SEL];
+  const visPend = linhas.filter(b=>bStatus(b)==='Pendente'); const allSel = visPend.length && visPend.every(b=>SEL.has(b.id));
+  const grupoDe = b => b.grupo ? S.db.banco.filter(x=>x.grupo===b.grupo) : [b];
+  const rowsHTML = linhas.map(b => { const s = bStatus(b); const ls = (b.links||[]).map(k=>byKey[k]).filter(Boolean); const tot = sum(ls,m=>m.valor); const gr = grupoDe(b); const gs = r2(sum(gr,x=>x.valor)); const dif = ls.length ? r2(gs - tot) : 0;
+    return `<tr class="${SEL.has(b.id)?'sel-row':''}"><td style="width:28px">${s==='Pendente'?`<input type="checkbox" ${SEL.has(b.id)?'checked':''} onchange="bSel('${b.id}',this.checked)">`:''}</td><td>${fdate(b.data)}${conta?'':`<div class="muted" style="font-size:11px">${esc(b.conta)}</div>`}</td><td>${esc(b.desc)}</td><td class="num ${b.valor<0?'neg':'pos'}">${money(b.valor)}</td>
       <td><span class="tag ${s==='Conciliado'?'good':s==='Ignorado'?'neutral':'bad'}">${s}${b.modo==='auto'?' · auto':''}</span></td>
-      <td style="max-width:380px">${ls.map(m=>`<div><span class="muted">${esc(m.tipo)}:</span> ${esc(m.desc)} <span class="mono" style="font-size:11.5px">${money(m.valor)}</span> <span class="muted" style="font-size:11px">${fdate(m.data)}</span></div>`).join('')}${dif?`<div class="neg" style="font-size:11.5px">diferença ${money(dif)}</div>`:''}${b.ignorado&&b.motivo?`<span class="muted">${esc(b.motivo)}</span>`:''}</td>
+      <td style="max-width:380px">${gr.length>1?`<div class="muted" style="font-size:11.5px">🔗 Grupo de ${gr.length} movimentos · soma ${money(gs)}</div>`:''}${ls.map(m=>`<div><span class="muted">${esc(m.tipo)}:</span> ${esc(m.desc)} <span class="mono" style="font-size:11.5px">${money(m.valor)}</span> <span class="muted" style="font-size:11px">${fdate(m.data)}</span></div>`).join('')}${dif?`<div class="neg" style="font-size:11.5px">diferença ${money(dif)}</div>`:''}${b.ignorado&&b.motivo?`<span class="muted">${esc(b.motivo)}</span>`:''}</td>
       <td><div class="row-act">${s==='Pendente'?`<button class="btn sm" onclick="concManual('${b.id}')">🔗 Conciliar</button><button class="btn sm" onclick="criarDoExtrato('${b.id}')">＋ Lançar</button><button class="icon-btn" title="Ignorar (transferência entre contas, aplicação…)" onclick="ignorarBanco('${b.id}')">🚫</button>`:`<button class="btn sm" onclick="desfazerBanco('${b.id}')">↺ Desfazer</button>`}<button class="icon-btn" title="Excluir do extrato" onclick="delBanco('${b.id}')">🗑</button></div></td></tr>`; }).join('');
   const semHTML = semExt.sort((a,b)=>a.data<b.data?-1:1).map(m => `<tr><td>${fdate(m.data)}</td><td><span class="tag neutral">${esc(m.tipo)}</span></td><td>${esc(m.desc)}</td><td class="num ${m.valor<0?'neg':'pos'}">${money(m.valor)}</td><td><button class="btn sm" onclick="go('${m.mod}')">Abrir módulo</button></td></tr>`).join('');
   $('#view').innerHTML = head + `<div class="kpis">${kp}</div>
@@ -1569,9 +1574,12 @@ function renderConciliacao(){
       <select onchange="UI.conta=this.value;render()"><option value="">Conta: todas</option>${contas.map(c=>`<option ${c===conta?'selected':''}>${esc(c)}</option>`).join('')}</select>
       ${tab==='extrato'?`<select onchange="UI.f.conc={st:this.value};render()"><option value="">Situação: todas</option>${['Pendente','Conciliado','Ignorado'].map(s=>`<option ${st===s?'selected':''}>${s}</option>`).join('')}</select>
       <input class="search" id="q_conc" placeholder="Buscar no extrato…" value="${esc(UI.q.conc||'')}" oninput="setQ('conc',this.value)">`:''}<span class="count">${periodLabel()}</span></div>
-      <div class="tbl-wrap">${tab==='extrato' ? `<table><thead><tr><th>Data</th><th>Descrição no banco</th><th class="num">Valor</th><th>Situação</th><th>Lançamento no sistema</th><th></th></tr></thead><tbody>${rowsHTML||`<tr><td colspan="6" class="empty">Nenhum movimento do extrato em ${periodLabel()}.</td></tr>`}</tbody></table>`
+      ${tab==='extrato' && SEL.size ? (() => { const sb = S.db.banco.filter(b=>SEL.has(b.id)); const sm = r2(sum(sb,b=>b.valor)); const misto = sb.some(b=>b.valor>0) && sb.some(b=>b.valor<0);
+        return `<div class="selbar"><b>${SEL.size}</b> movimento(s) selecionado(s) · soma <b class="mono ${sm<0?'neg':'pos'}">${money(sm)}</b>${misto?' <span class="tag warn">entradas e saídas misturadas</span>':''}
+          <span style="margin-left:auto;display:flex;gap:6px"><button class="btn sm" onclick="window._bSel=[];render()">Limpar seleção</button><button class="btn sm primary" ${misto?'disabled':''} onclick="concManual(window._bSel.slice())">🔗 Conciliar em grupo</button></span></div>`; })() : ''}
+      <div class="tbl-wrap">${tab==='extrato' ? `<table><thead><tr><th style="width:28px">${visPend.length?`<input type="checkbox" title="Selecionar todos os pendentes visíveis" ${allSel?'checked':''} onchange="bSelTodos(this.checked)">`:''}</th><th>Data</th><th>Descrição no banco</th><th class="num">Valor</th><th>Situação</th><th>Lançamento no sistema</th><th></th></tr></thead><tbody>${rowsHTML||`<tr><td colspan="7" class="empty">Nenhum movimento do extrato em ${periodLabel()}.</td></tr>`}</tbody></table>`
         : `<table><thead><tr><th>Data</th><th>Tipo</th><th>Lançamento</th><th class="num">Valor</th><th></th></tr></thead><tbody>${semHTML||'<tr><td colspan="5" class="empty">Todos os lançamentos do intervalo do extrato foram encontrados no banco.</td></tr>'}</tbody></table>`}</div>
-      <div class="note">${tab==='extrato' ? '<b>Pendente</b> = movimento do banco sem lançamento correspondente no sistema: concilie com um lançamento existente (pode marcar vários que somem o valor, como um repasse de cartão com várias parcelas) ou lance a partir do extrato.' : 'Lançamentos do sistema dentro do intervalo do extrato que não apareceram no banco: podem ter sido pagos por outra conta, em dinheiro, ou lançados com data/valor errado.'}</div></div>`;
+      <div class="note">${tab==='extrato' ? '<b>Pendente</b> = movimento do banco sem lançamento correspondente no sistema. Um movimento pode ser conciliado com vários lançamentos (ex.: repasse de cartão com várias parcelas). E <b>vários movimentos</b> podem ser conciliados com <b>um</b> lançamento: marque as caixinhas (ex.: os PIX de cada funcionário) e use <b>Conciliar em grupo</b> para bater com a conta da folha ou do vale-transporte. Dica: busque “vale” ou “salário” e use a caixinha do cabeçalho para marcar todos.' : 'Lançamentos do sistema dentro do intervalo do extrato que não apareceram no banco: podem ter sido pagos por outra conta, em dinheiro, ou lançados com data/valor errado.'}</div></div>`;
 }
 window.exportConc = () => {
   if (!window.XLSX){ toast('Exportação para Excel indisponível sem internet.', true); return; }
@@ -1585,35 +1593,43 @@ window.ignorarBanco = id => { const b = S.db.banco.find(x=>x.id===id);
     <div class="modal-f"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn primary" id="ig_ok">Ignorar</button></div>`, true);
   $('#ig_ok').onclick = () => { b.ignorado = true; b.motivo = $('#ig_m').value; save(); closeModal(); render(); };
 };
-window.desfazerBanco = id => { const b = S.db.banco.find(x=>x.id===id); b.links = null; b.modo = null; b.ignorado = false; b.motivo = ''; save(); render(); };
+window.desfazerBanco = id => { const b = S.db.banco.find(x=>x.id===id); const gr = b.grupo ? S.db.banco.filter(x=>x.grupo===b.grupo) : [b]; gr.forEach(x => { x.links = null; x.modo = null; x.grupo = null; x.ignorado = false; x.motivo = ''; }); save(); if (gr.length>1) toast(`Grupo desfeito: ${gr.length} movimentos voltaram a pendentes.`); render(); };
+window.bSel = (id, on) => { const s = new Set(window._bSel||[]); on ? s.add(id) : s.delete(id); window._bSel = [...s]; render(); };
+window.bSelTodos = on => { const lis = [...document.querySelectorAll('#view tbody input[type=checkbox][onchange^="bSel("]')].map(i => i.getAttribute('onchange').match(/bSel\('([^']+)'/)[1]); const s = new Set(window._bSel||[]); lis.forEach(id => on ? s.add(id) : s.delete(id)); window._bSel = [...s]; render(); };
 window.delBanco = id => confirmBox('Excluir movimento do extrato', 'Remove esta linha do extrato importado (os lançamentos do sistema não são alterados).', 'Excluir', () => { S.db.banco = S.db.banco.filter(x=>x.id!==id); save(); render(); });
-window.concManual = (id, filtro='') => {
-  const b = S.db.banco.find(x=>x.id===id); const lm = linkMap();
-  const sel = new Set((window._concSel && window._concSel.id===id) ? window._concSel.keys : []); window._concSel = {id, keys:[...sel]};
+window.concManual = (alvo, filtro='') => {
+  const ids = Array.isArray(alvo) ? alvo : [alvo]; const gkey = ids.join(','); const bs = S.db.banco.filter(x=>ids.includes(x.id)); if (!bs.length) return;
+  const lm = linkMap(); const V = r2(sum(bs, x=>x.valor)); const dts = bs.map(x=>x.data).sort(); const d0 = dts[0], d1 = dts[dts.length-1];
+  const sel = new Set((window._concSel && window._concSel.id===gkey) ? window._concSel.keys : []); window._concSel = {id:gkey, ids, keys:[...sel]};
   const dias = +(window._concDias||10);
-  let c = movimentos().filter(m => Math.sign(m.valor)===Math.sign(b.valor) && (!lm[m.key] || lm[m.key]===id) && Math.abs(days(m.data,b.data))<=dias);
+  const dist = m => m.data < d0 ? days(m.data, d0) : m.data > d1 ? days(d1, m.data) : 0;
+  let c = movimentos().filter(m => Math.sign(m.valor)===Math.sign(V) && (!lm[m.key] || ids.includes(lm[m.key])) && dist(m) <= dias);
   const f = norm(filtro); if (f) c = c.filter(m => norm(m.tipo+' '+m.desc+' '+m.valor).includes(f));
-  c.sort((x,y) => (Math.abs(x.valor-b.valor) - Math.abs(y.valor-b.valor)) || (Math.abs(days(x.data,b.data)) - Math.abs(days(y.data,b.data))));
-  const mov = movimentos(); const tot = sum(mov.filter(m=>sel.has(m.key)), m=>m.valor); const dif = r2(b.valor - tot);
-  openModal(`<div class="modal-h"><h3>🔗 Conciliar movimento</h3><button class="x" onclick="closeModal()">×</button></div>
+  c.sort((x,y) => (Math.abs(x.valor-V) - Math.abs(y.valor-V)) || (dist(x) - dist(y)));
+  const mov = movimentos(); const tot = sum(mov.filter(m=>sel.has(m.key)), m=>m.valor); const dif = r2(V - tot);
+  const cab = bs.length === 1 ? `Extrato · ${esc(bs[0].conta)} · ${fdate(bs[0].data)} · ${esc(bs[0].desc)} · <b class="${V<0?'neg':'pos'}">${money(V)}</b>`
+    : `<b>${bs.length} movimentos do extrato</b> (${fdate(d0)}${d1!==d0?' a '+fdate(d1):''}) · soma <b class="${V<0?'neg':'pos'}">${money(V)}</b><div style="max-height:96px;overflow:auto;margin-top:6px;font-size:11.5px">${bs.map(x=>`<div>${fdate(x.data)} · ${esc(x.desc)} · <span class="mono">${money(x.valor)}</span></div>`).join('')}</div>`;
+  openModal(`<div class="modal-h"><h3>🔗 ${bs.length>1?'Conciliar em grupo':'Conciliar movimento'}</h3><button class="x" onclick="closeModal()">×</button></div>
     <div class="modal-b" style="display:block">
-      <div class="calc" style="margin-bottom:12px">Extrato · ${esc(b.conta)} · ${fdate(b.data)} · ${esc(b.desc)} · <b class="${b.valor<0?'neg':'pos'}">${money(b.valor)}</b></div>
+      <div class="calc" style="margin-bottom:12px">${cab}</div>
       <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap"><input class="search" id="cm_q" placeholder="Filtrar lançamentos (fornecedor, OS, valor…)" value="${esc(filtro)}" style="max-width:none">
         <select id="cm_d" style="height:32px;background:var(--bg);border:1px solid var(--border-2);border-radius:8px;padding:0 8px">${[3,10,30,90].map(d=>`<option value="${d}" ${d===dias?'selected':''}>até ${d} dias</option>`).join('')}</select></div>
       <div class="tbl-wrap" style="max-height:340px"><table><thead><tr><th></th><th>Data</th><th>Tipo</th><th>Lançamento</th><th class="num">Valor</th></tr></thead><tbody>
-      ${c.slice(0,200).map(m=>`<tr style="cursor:pointer" onclick="togConc('${id}','${m.key}')"><td><input type="checkbox" ${sel.has(m.key)?'checked':''} style="pointer-events:none"></td><td>${fdate(m.data)}</td><td><span class="tag neutral">${esc(m.tipo)}</span></td><td>${esc(m.desc)}</td><td class="num ${Math.abs(m.valor-b.valor)<=0.01?'pos':''}">${money(m.valor)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">Nenhum lançamento compatível nesse intervalo. Aumente o prazo ou use “＋ Lançar” para criar a partir do extrato.</td></tr>'}</tbody></table></div>
-      <div class="imp-sum" style="margin-top:12px">Selecionado: <b>${money(tot)}</b> · Extrato: <b>${money(b.valor)}</b> · Diferença: <b class="${Math.abs(dif)>0.01?'neg':'pos'}">${money(dif)}</b>
+      ${c.slice(0,200).map(m=>`<tr style="cursor:pointer" onclick="togConc('${m.key}')"><td><input type="checkbox" ${sel.has(m.key)?'checked':''} style="pointer-events:none"></td><td>${fdate(m.data)}</td><td><span class="tag neutral">${esc(m.tipo)}</span></td><td>${esc(m.desc)}${Math.abs(m.valor-V)<=0.01?' <span class="tag good">valor exato</span>':''}</td><td class="num ${Math.abs(m.valor-V)<=0.01?'pos':''}">${money(m.valor)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">Nenhum lançamento compatível nesse intervalo. Aumente o prazo ou use “＋ Lançar” para criar a partir do extrato.</td></tr>'}</tbody></table></div>
+      <div class="imp-sum" style="margin-top:12px">Selecionado: <b>${money(tot)}</b> · Extrato: <b>${money(V)}</b> · Diferença: <b class="${Math.abs(dif)>0.01?'neg':'pos'}">${money(dif)}</b>
         ${Math.abs(dif)>0.01 && sel.size ? '<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="cm_dif"> aceitar diferença (tarifa, juros, arredondamento)</label>' : ''}</div></div>
-    <div class="modal-f"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn primary" onclick="okConc('${id}')" ${sel.size?'':'disabled'}>Conciliar ${sel.size} lançamento(s)</button></div>`, 'lg');
+    <div class="modal-f"><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn primary" onclick="okConc()" ${sel.size?'':'disabled'}>Conciliar ${bs.length>1?bs.length+' movimentos com ':''}${sel.size} lançamento(s)</button></div>`, 'lg');
   const qi = $('#cm_q'); qi.focus(); qi.setSelectionRange(filtro.length, filtro.length);
-  let tm; qi.oninput = () => { clearTimeout(tm); tm = setTimeout(()=>concManual(id, qi.value), 250); };
-  $('#cm_d').onchange = e => { window._concDias = +e.target.value; concManual(id, qi.value); };
+  let tm; qi.oninput = () => { clearTimeout(tm); tm = setTimeout(()=>concManual(ids.length>1?ids:ids[0], qi.value), 250); };
+  $('#cm_d').onchange = e => { window._concDias = +e.target.value; concManual(ids.length>1?ids:ids[0], qi.value); };
 };
-window.togConc = (id, key) => { const s = window._concSel; const i = s.keys.indexOf(key); if (i>=0) s.keys.splice(i,1); else s.keys.push(key); concManual(id, $('#cm_q') ? $('#cm_q').value : ''); };
-window.okConc = id => {
-  const b = S.db.banco.find(x=>x.id===id); const keys = window._concSel.keys; const tot = sum(movimentos().filter(m=>keys.includes(m.key)), m=>m.valor);
-  if (Math.abs(b.valor-tot) > 0.01 && !($('#cm_dif') && $('#cm_dif').checked)){ toast('Os valores não batem — marque “aceitar diferença” ou ajuste a seleção.', true); return; }
-  b.links = keys.slice(); b.modo = 'manual'; window._concSel = null; save(); closeModal(); toast('Movimento conciliado.'); render();
+window.togConc = (a, b) => { const key = b === undefined ? a : b; const s = window._concSel; const i = s.keys.indexOf(key); if (i>=0) s.keys.splice(i,1); else s.keys.push(key); concManual(s.ids.length>1?s.ids:s.ids[0], $('#cm_q') ? $('#cm_q').value : ''); };
+window.okConc = () => {
+  const s = window._concSel; const bs = S.db.banco.filter(x=>s.ids.includes(x.id)); const V = sum(bs,x=>x.valor); const tot = sum(movimentos().filter(m=>s.keys.includes(m.key)), m=>m.valor);
+  if (Math.abs(V-tot) > 0.01 && !($('#cm_dif') && $('#cm_dif').checked)){ toast('Os valores não batem — marque “aceitar diferença” ou ajuste a seleção.', true); return; }
+  const gid = bs.length > 1 ? uid('g') : null;
+  bs.forEach(b => { b.links = s.keys.slice(); b.modo = 'manual'; b.grupo = gid; });
+  window._concSel = null; window._bSel = []; save(); closeModal(); toast(bs.length>1 ? `${bs.length} movimentos conciliados em grupo.` : 'Movimento conciliado.'); render();
 };
 window.criarDoExtrato = id => {
   const b = S.db.banco.find(x=>x.id===id); const ent = b.valor > 0; const v = Math.abs(b.valor);
