@@ -632,7 +632,7 @@ const MODS = {
     defaults:()=>({venc:TODAY,status:'aberto',categoria:'gerais',juros:0,multa:0}),
     compute(r){ if (!r.competencia && r.venc) r.competencia = r.venc.slice(0,7); if (r.status==='pago'){ r.dataPg = r.dataPg || TODAY; if (!+r.valorPago) r.valorPago = r2((+r.valor||0)+(+r.juros||0)+(+r.multa||0)); } else { r.valorPago = 0; r.dataPg = null; } },
     actions:[{i:'💸',t:'Registrar pagamento hoje',show:r=>r.status!=='pago',run:r=>{ r.status='pago'; r.dataPg=TODAY; r.valorPago=r2((+r.valor||0)+(+r.juros||0)+(+r.multa||0)); save(); toast(`${r.fornecedor}: pagamento registrado.`); render(); }}],
-    extraActions:()=>`<button class="btn" onclick="recorrencia()" title="Copia as contas do mês selecionado para o mês seguinte, em aberto">↻ Gerar próximo mês</button>`,
+    extraActions:()=>`<button class="btn" onclick="importarGC()" title="Importa a planilha de Contas a Pagar exportada do GestãoClick">📥 Importar do GestãoClick</button><button class="btn" onclick="recorrencia()" title="Copia as contas do mês selecionado para o mês seguinte, em aberto">↻ Gerar próximo mês</button>`,
     kpis(rows){
       const prev=sum(rows,cpEfetivo), pago=sum(rows.filter(r=>r.status==='pago'),r=>r.valorPago), ab=rows.filter(r=>r.status!=='pago'), venc=ab.filter(r=>cpStatus(r)==='Vencido'), j=sum(rows,r=>(+r.juros||0)+(+r.multa||0));
       const prox = S.db.pagar.filter(r=>r.status!=='pago' && days(TODAY,r.venc)>=0 && days(TODAY,r.venc)<=7);
@@ -1716,6 +1716,154 @@ window.salvarPlano = () => {
 };
 
 /* =====================================================================
+   IMPORTAÇÃO DO CONTAS A PAGAR DO GESTÃOCLICK (XLSX / CSV)
+   Colunas: Cód. Interno · Data · Entidade · Descrição · Forma de pagamento ·
+            Plano de contas · Situação · Valor
+   - Cód. Interno vira a chave: reimportar atualiza (ex.: "Em aberto" → "Confirmado")
+   - Plano de contas do GestãoClick é traduzido para o plano do sistema
+     (a escolha fica memorizada para as próximas importações)
+   ===================================================================== */
+const GC_REGRAS = [ // [regex sobre descrição + plano GC + entidade, destino]
+  [/parcelad|parcelamento|acordo/, 'p:acordos'],
+  [/vale.?transp/, 'p:vale_transporte'], [/ferias/, 'p:ferias'], [/\b13[ºo°]?\s*sal|decimo/, 'p:decimo'], [/rescis/, 'p:rescisao'],
+  [/salario|folha/, 'p:folha'], [/fgts|inss|encargo|darf previd/, 'p:encargos'], [/diarist/, 'p:diaristas'],
+  [/pro.?labore|retirada|diretoria/, 'p:prolabore'],
+  [/aluguel.*loja|loja.*aluguel/, 'p:aluguel_loja'], [/iptu/, 'p:iptu'], [/agua|esgoto|cedae/, 'p:agua'], [/aluguel/, 'p:aluguel_conf'],
+  [/energia|light|enel/, 'p:energia'], [/internet|telefon|claro|vivo|\btim\b|celular/, 'p:internet'], [/alarme|seguranca|emive/, 'p:seguranca'],
+  [/contab|alterdata|servidor|nuvem/, 'p:contabil'], [/software|sistema|licen|simulador|jumptec|monday|gestao ?click|nuvemshop|hospedagem/, 'p:sistemas'],
+  [/emprest|financiament/, 'p:emprestimo'], [/equipament|maquina|impressora|calandra|carrossel/, 'p:maquinas'],
+  [/simples|\bdas\b|imposto|receita federal|tributo/, 'p:impostos'], [/marketing|trafego|facebook|instagram|google ads|anuncio|meta ads/, 'p:marketing'],
+  [/tecido|malha|helanca|dry ?fit|microfibra/, 'c:tecido'], [/tinta/, 'c:tinta'], [/papel|bobina/, 'c:papel'], [/bordad/, 'c:bordado'],
+  [/aviament|elastico|gola|linha |etiqueta|embalage|sacola/, 'c:aviamento'],
+  [/correio|sedex|\bpac\b/, 'l:correio'], [/combust|posto|gasolina/, 'l:combustivel'], [/estacionamento/, 'l:estacionamento'],
+  [/moto ?taxi|motoboy/, 'l:mototaxi'], [/uber|lalamove|frete|entrega/, 'l:envio'],
+];
+let GCI = null;
+const gcNum = v => typeof v === 'number' ? v : brNum(v);
+const gcData = v => { if (v instanceof Date && !isNaN(v)) return iso(new Date(v.getTime() + v.getTimezoneOffset()*60000)); if (typeof v === 'number') return iso(new Date(Math.round((v - 25569) * 864e5) + new Date().getTimezoneOffset()*60000)); return brDate(v) || (/^\d{4}-\d{2}-\d{2}/.test(String(v||'')) ? String(v).slice(0,10) : null); };
+function gcDestinos(){
+  const g = (lbl, arr) => `<optgroup label="${lbl}">${arr.map(([v,l]) => `<option value="${v}">${esc(l)}</option>`).join('')}</optgroup>`;
+  return g('Contas a pagar (despesas)', Object.entries(PLANO).map(([k,p]) => ['p:'+k, `${p.n} — ${GRUPOS[p.g]}`]))
+    + g('Compras de insumos (CMV)', Object.entries(COMPRAS).map(([k,c]) => ['c:'+k, c.n]))
+    + g('Logística', Object.entries(LOGT).map(([k,l]) => ['l:'+k, l]))
+    + g('Outros', [['novo','➕ Criar conta nova com o nome do GestãoClick'], ['x','Não importar']]);
+}
+function gcSugerir(row){
+  const valido = d => { if (!d) return null; const [t,k] = d.split(':'); return (t==='p' ? PLANO[k] : t==='c' ? COMPRAS[k] : LOGT[k]) ? d : null; };
+  const regra = txt => { for (const [re, dest] of GC_REGRAS) if (re.test(txt) && valido(dest)) return dest; return null; };
+  // 1º a descrição/fornecedor (mais específico) · 2º o que você já escolheu para este plano do GestãoClick · 3º o nome do plano · 4º despesas gerais
+  return regra(norm(`${row.desc} ${row.entidade}`)) || valido((S.cfg.mapaGC || {})[row.planoGC]) || regra(norm(row.planoGC)) || 'p:gerais';
+}
+function gcCompet(row){
+  const m = row.desc.match(/\b(0[1-9]|1[0-2])\/(20\d\d)\b/); if (m) return `${m[2]}-${m[1]}`;
+  if (!row.data) return null; const k = row.dest.slice(2);
+  if (row.dest.startsWith('p:') && ['folha','encargos'].includes(k)) return addMonths(row.data.slice(0,7)+'-01', -1).slice(0,7); // folha e encargos: competência do mês anterior
+  return row.data.slice(0,7);
+}
+const gcSiglas = s => s.replace(/\b(Fgts|Iptu|Inss|Das|Darf|Cnpj|Ltda|Epp|Me|S\.a\.?|S\/a|Ti|Rh)\b/g, m => m.toUpperCase());
+const gcFornecedor = r => { if (r.entidade) return gcSiglas(cap(r.entidade)); let d = r.desc.replace(/\s*\(\d+\s*\/\s*\d+\)\s*/g,' ').replace(/\s*-\s*[^-]*$/,'').trim(); return gcSiglas(cap(d)) || 'Fornecedor não informado'; };
+function gcExistente(cod){ for (const c of ['pagar','compras','logistica']){ const r = S.db[c].find(x => String(x.gcId) === String(cod)); if (r) return {c, r}; } return null; }
+
+window.importarGC = () => {
+  openModal(`<div class="modal-h"><h3>📥 Importar Contas a Pagar do GestãoClick</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="modal-b" style="display:block">
+      <label id="drop" class="drop"><input type="file" accept=".xlsx,.xls,.csv" style="display:none" onchange="lerGC(this.files[0])"><div style="font-size:30px">📥</div><b>Arraste aqui a planilha exportada do GestãoClick</b><span class="muted">Financeiro › Contas a pagar › exportar (XLSX) — colunas Cód. Interno, Data, Entidade, Descrição, Forma de pagamento, Plano de contas, Situação e Valor</span></label>
+      <div class="muted" style="font-size:12px;margin-top:12px">O <b>Cód. Interno</b> evita duplicidade: importar de novo o mesmo período só <b>atualiza</b> o que mudou (ex.: uma conta “Em aberto” que virou “Confirmado”). O plano de contas do GestãoClick é traduzido para o do sistema e a escolha fica memorizada.</div>
+    </div>`, 'lg');
+  const d = $('#drop'); ['dragenter','dragover'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.add('on'); })); ['dragleave','drop'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.remove('on'); }));
+  d.addEventListener('drop', e => lerGC(e.dataTransfer.files[0]));
+};
+window.lerGC = async (file) => {
+  if (!file) return;
+  if (!window.XLSX){ toast('A leitura de planilhas precisa de internet (biblioteca XLSX não carregou).', true); return; }
+  try {
+    const wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), {type:'array', cellDates:true});
+    const ws = wb.Sheets[wb.SheetNames[0]]; const M = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null});
+    const hi = M.findIndex(r => r && r.some(c => /descri/i.test(String(c||''))) && r.some(c => /valor/i.test(String(c||''))));
+    if (hi < 0) throw new Error('Não encontrei o cabeçalho (Descrição / Valor) na planilha.');
+    const H = M[hi].map(c => norm(c)); const col = (...re) => { for (const r of re){ const i = H.findIndex(h => r.test(h)); if (i >= 0) return i; } return -1; };
+    const cC = col(/cod/), cD = col(/^data/, /venc/), cE = col(/entidade/, /fornecedor/, /favorecido/), cDs = col(/descri/), cF = col(/forma/), cP = col(/plano/), cS = col(/situa/, /status/), cV = col(/^valor/);
+    const rows = []; let positivos = 0;
+    M.slice(hi+1).forEach(r => {
+      if (!r || r.every(c => c === null || c === '')) return;
+      const v = gcNum(r[cV]); if (!v) return; if (v > 0){ positivos++; return; }
+      const row = {cod: cC>=0 ? String(r[cC]??'').trim() : '', data: gcData(r[cD]), entidade: String(r[cE]??'').trim(), desc: String(r[cDs]??'').trim(), forma: String(r[cF]??'').trim(),
+        planoGC: String(r[cP]??'').trim() || '(sem plano)', situacao: String(r[cS]??'').trim(), valor: r2(Math.abs(v))};
+      row.pago = /confirm|pago|quitad|baixad/i.test(row.situacao);
+      if (!row.cod) row.cod = `${row.data}|${row.valor}|${norm(row.desc).slice(0,40)}`;
+      row.dest = gcSugerir(row); row.comp = gcCompet(row); row.forn = gcFornecedor(row);
+      const ex = gcExistente(row.cod);
+      if (ex){ const r0 = ex.r; const mud = ex.c==='pagar' ? (r0.status !== (row.pago?'pago':'aberto') || Math.abs((+r0.valor||0) - row.valor) > 0.009 || r0.venc !== row.data) : (Math.abs((+(r0.total ?? r0.valor)||0) - row.valor) > 0.009 || r0.data !== row.data);
+        row.estado = mud ? 'atualiza' : 'igual'; row.ok = mud; row.dest = ex.c==='pagar' ? 'p:'+r0.categoria : ex.c==='compras' ? 'c:'+r0.cat : 'l:'+r0.tipo; row.comp = ex.c==='pagar' ? (r0.competencia || row.comp) : row.comp; }
+      else { const dup = S.db.pagar.find(p => !p.gcId && Math.abs((+p.valor||0) - row.valor) <= 0.01 && p.venc && row.data && Math.abs(days(p.venc, row.data)) <= 3);
+        row.estado = dup ? 'duplicado' : 'novo'; row.ok = !dup; row.dupDe = dup ? `${dup.fornecedor} · ${fdate(dup.venc)}` : ''; }
+      rows.push(row);
+    });
+    if (!rows.length) throw new Error(positivos ? 'A planilha só tem valores positivos (recebimentos). Esta importação é do Contas a Pagar.' : 'Nenhum lançamento encontrado.');
+    GCI = {arquivo:file.name, rows, positivos, novas:{}}; previewGC();
+  } catch(e){ toast(e.message || 'Não foi possível ler a planilha.', true); }
+};
+function previewGC(){
+  const R = GCI.rows; const sel = R.filter(r => r.ok && r.dest !== 'x');
+  const cats = {}; R.forEach(r => { const c = cats[r.planoGC] = cats[r.planoGC] || {n:0, v:0}; c.n++; c.v += r.valor; });
+  const ds = R.map(r=>r.data).filter(Boolean).sort();
+  const nomeDest = d => { if (d==='x') return 'Não importar'; if (d==='novo') return 'Nova conta'; const [t,k] = d.split(':'); return t==='p' ? (PLANO[k]||{}).n : t==='c' ? 'Insumo: '+(COMPRAS[k]||{}).n : 'Logística: '+LOGT[k]; };
+  const opts = gcDestinos();
+  const tagE = {novo:['good','Novo'], atualiza:['info','Atualiza'], igual:['neutral','Sem mudança'], duplicado:['warn','Possível duplicado']};
+  $('#modal').innerHTML = `<div class="modal-h"><h3>Conferir importação · ${esc(GCI.arquivo)}</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="modal-b" style="display:block;max-height:70vh;overflow:auto">
+      <div class="kpis" style="grid-template-columns:repeat(5,1fr)">${kpi('Lançamentos', String(R.length), ds.length ? `${fdate(ds[0])} a ${fdate(ds[ds.length-1])}` : '', 't-blue')}${kpi('Novos', String(R.filter(r=>r.estado==='novo').length), '', 't-green')}${kpi('Atualizações', String(R.filter(r=>r.estado==='atualiza').length), `${R.filter(r=>r.estado==='igual').length} sem mudança`, 't-gray')}${kpi('Pagos / em aberto', `${R.filter(r=>r.pago).length} / ${R.filter(r=>!r.pago).length}`, '', 't-yellow')}${kpi('Selecionado', kmoney(sum(sel,r=>r.valor)), `${sel.length} lançamento(s)`, 't-red')}</div>
+      ${GCI.positivos ? `<div class="imp-warn">⚠️ ${GCI.positivos} linha(s) com valor positivo (recebimento) foram ignoradas.</div>` : ''}
+      ${R.some(r=>r.estado==='duplicado') ? `<div class="imp-warn">⚠️ Alguns lançamentos parecem já existir no sistema (mesmo valor e vencimento próximo, lançados à mão). Eles vêm <b>desmarcados</b> — confira antes de marcar.</div>` : ''}
+      <div class="panel" style="margin:12px 0"><div class="panel-h"><h3>Plano de contas: GestãoClick → sistema</h3><span class="sub">aplica a todas as linhas da categoria e fica memorizado</span></div>
+        <div class="tbl-wrap" style="max-height:none"><table class="imp-t"><thead><tr><th>Plano de contas (GestãoClick)</th><th class="num">Linhas</th><th class="num">Valor</th><th>Aplicar a todas as linhas como</th></tr></thead><tbody>
+        ${Object.entries(cats).map(([c,o]) => `<tr><td>${esc(c)}</td><td class="num">${o.n}</td><td class="num">${money(o.v)}</td><td><select onchange="gcAplicarCat(${JSON.stringify(c).replace(/"/g,'&quot;')}, this.value)"><option value="">— manter sugestões por linha —</option>${opts}</select></td></tr>`).join('')}
+        </tbody></table></div></div>
+      <div class="panel"><div class="panel-h"><h3>Lançamentos</h3><span class="sub">o sistema sugere a conta pela descrição; ajuste o que precisar</span><div class="right"><button class="btn sm" onclick="GCI.rows.forEach(r=>{if(r.estado!=='igual')r.ok=true});previewGC()">Marcar todos</button><button class="btn sm" onclick="GCI.rows.forEach(r=>r.ok=false);previewGC()">Desmarcar todos</button></div></div>
+        <div class="tbl-wrap" style="max-height:none"><table class="imp-t"><thead><tr><th></th><th>Data</th><th>Descrição (GestãoClick)</th><th class="num">Valor</th><th>Situação</th><th>Lançar em</th><th>Competência</th><th></th></tr></thead><tbody>
+        ${R.map((r,i) => `<tr class="${r.ok?'':'muted'}"><td><input type="checkbox" ${r.ok?'checked':''} onchange="GCI.rows[${i}].ok=this.checked;previewGC()"></td><td>${fdate(r.data)}</td>
+          <td>${esc(r.desc)}<div class="muted" style="font-size:11px">${esc(r.forn)} · ${esc(r.planoGC)} · cód. ${esc(r.cod)}</div></td><td class="num">${money(r.valor)}</td>
+          <td><span class="tag ${r.pago?'good':'info'}">${r.pago?'Pago':'Em aberto'}</span></td>
+          <td><select data-i="${i}" onchange="gcDest(${i}, this.value)">${opts}</select>${r.dest==='novo'?`<div class="muted" style="font-size:11px">nova conta “${esc(r.planoGC)}” em <select onchange="GCI.novas[${JSON.stringify(r.planoGC).replace(/"/g,'&quot;')}]=this.value">${Object.entries(GRUPOS).map(([g,l])=>`<option value="${g}" ${(GCI.novas[r.planoGC]||'admin')===g?'selected':''}>${esc(l)}</option>`).join('')}</select></div>`:''}</td>
+          <td>${r.dest.startsWith('p:')||r.dest==='novo' ? `<input type="month" value="${r.comp||''}" onchange="GCI.rows[${i}].comp=this.value" style="width:130px">` : '<span class="muted">data da compra</span>'}</td>
+          <td><span class="tag ${tagE[r.estado][0]}" title="${esc(r.dupDe||'')}">${tagE[r.estado][1]}</span></td></tr>`).join('')}
+        </tbody></table></div>
+        <div class="note">Folha e encargos (FGTS/INSS) vêm com competência do <b>mês anterior</b> ao pagamento; se a descrição tiver “MM/AAAA”, vale esse mês. Insumos e logística entram pela data da compra.</div></div>
+    </div>
+    <div class="modal-f"><button class="btn ghost" onclick="importarGC()">← Outro arquivo</button><span style="flex:1"></span><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn primary" onclick="confirmarGC()" ${sel.length?'':'disabled'}>Importar ${sel.length} lançamento(s)</button></div>`;
+  document.querySelectorAll('#modal select[data-i]').forEach(s => { s.value = GCI.rows[+s.dataset.i].dest; });
+}
+window.previewGC = previewGC;
+window.gcDest = (i, v) => { const r = GCI.rows[i]; r.dest = v; if (v.startsWith('p:') || v==='novo') r.comp = r.comp || gcCompet(r); previewGC(); };
+window.gcAplicarCat = (cat, v) => { if (!v) return; GCI.rows.filter(r => r.planoGC === cat && r.estado !== 'igual').forEach(r => { r.dest = v; r.comp = gcCompet(r); }); GCI.catMap = Object.assign(GCI.catMap||{}, {[cat]: v}); previewGC(); };
+window.confirmarGC = () => {
+  let n = 0, u = 0; const novasContas = {};
+  S.cfg.mapaGC = S.cfg.mapaGC || {};
+  GCI.rows.filter(r => r.ok && r.dest !== 'x').forEach(r => {
+    let dest = r.dest;
+    if (dest === 'novo'){
+      if (!novasContas[r.planoGC]){
+        S.cfg.plano = S.cfg.plano || JSON.parse(JSON.stringify(PLANO_PADRAO));
+        let k = norm(r.planoGC).replace(/[^a-z0-9]+/g,'_').replace(/^_|_$/g,'').slice(0,30) || 'conta'; while (S.cfg.plano.contas[k] && S.cfg.plano.contas[k].n !== cap(r.planoGC)) k += '_2';
+        S.cfg.plano.contas[k] = {n: cap(r.planoGC), g: GCI.novas[r.planoGC] || 'admin'}; applyPlano(); novasContas[r.planoGC] = 'p:'+k;
+      }
+      dest = novasContas[r.planoGC];
+    }
+    const [t, k] = dest.split(':'); const ex = gcExistente(r.cod); const id = 'gc' + String(r.cod).replace(/[^\w-]/g,'_');
+    const obs = 'Importado do GestãoClick';
+    if (ex){ ['pagar','compras','logistica'].forEach(c => S.db[c] = S.db[c].filter(x => x !== ex.r)); u++; } else n++;
+    if (t === 'p') S.db.pagar.push({id, gcId:r.cod, fornecedor:r.forn, descricao:r.desc, categoria:k, valor:r.valor, venc:r.data, competencia:r.comp || (r.data||'').slice(0,7), status:r.pago?'pago':'aberto', dataPg:r.pago?r.data:null, juros:0, multa:0, valorPago:r.pago?r.valor:0, fonte:r.forma, obs:(ex && ex.r.obs) || obs});
+    if (t === 'c') S.db.compras.push({id, gcId:r.cod, cat:k, data:r.data, item:r.desc, fornecedor:r.forn, qtd:null, unid:(COMPRAS[k]||{}).u||'un', preco:null, total:r.valor, extra:obs});
+    if (t === 'l') S.db.logistica.push({id, gcId:r.cod, tipo:k, data:r.data, prestador:r.forn, origem:'', destino:'', qtd:1, valor:r.valor, obs:r.desc});
+    if (GCI.catMap && GCI.catMap[r.planoGC]) S.cfg.mapaGC[r.planoGC] = GCI.catMap[r.planoGC] === 'novo' ? novasContas[r.planoGC] : GCI.catMap[r.planoGC];
+  });
+  save(); closeModal();
+  toast(`GestãoClick: ${n} lançamento(s) novo(s), ${u} atualizado(s)${Object.keys(novasContas).length?` · ${Object.keys(novasContas).length} conta(s) criada(s) no plano`:''}.`);
+  const ds = GCI.rows.filter(r=>r.ok).map(r=>r.data).filter(Boolean).sort(); if (ds.length){ UI.year = +ds[ds.length-1].slice(0,4); UI.month = +ds[ds.length-1].slice(5,7); fillPeriod(); persistUI(); }
+  go('pagar');
+};
+
+/* =====================================================================
    MODO ONLINE — Supabase (login, sincronização, tempo real, usuários)
    Ativo só quando config.js traz supabaseUrl e supabaseAnonKey.
    ===================================================================== */
@@ -1972,7 +2120,7 @@ $('#selMonth').onchange = e => { UI.month = +e.target.value; persistUI(); render
 $('#burger').onclick = () => document.body.classList.toggle('menu');
 $('#scrim').onclick = () => document.body.classList.remove('menu');
 $('#quickAdd').onclick = () => {
-  openModal(`<div class="modal-h"><h3>O que você quer lançar?</h3><button class="x" onclick="closeModal()">×</button></div><div class="modal-b"><button class="btn primary full" style="height:52px;justify-content:flex-start" onclick="importarOS()">📄 Importar Ordem de Serviço (PDF) — lança sinal, cartão e duplicata</button>${MOD_KEYS.map(k=>`<button class="btn" style="height:48px;justify-content:flex-start" onclick="closeModal();go('${k}');setTimeout(()=>editRow('${k}'),30)">${MODS[k].icon} ${MODS[k].title}</button>`).join('')}</div>`);
+  openModal(`<div class="modal-h"><h3>O que você quer lançar?</h3><button class="x" onclick="closeModal()">×</button></div><div class="modal-b"><button class="btn primary full" style="height:52px;justify-content:flex-start" onclick="importarOS()">📄 Importar Ordem de Serviço (PDF) — lança sinal, cartão e duplicata</button><button class="btn full" style="height:52px;justify-content:flex-start" onclick="importarGC()">📥 Importar Contas a Pagar do GestãoClick (XLSX)</button>${MOD_KEYS.map(k=>`<button class="btn" style="height:48px;justify-content:flex-start" onclick="closeModal();go('${k}');setTimeout(()=>editRow('${k}'),30)">${MODS[k].icon} ${MODS[k].title}</button>`).join('')}</div>`);
 };
 function render(){
   killCharts();
