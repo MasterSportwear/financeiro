@@ -652,6 +652,7 @@ const MODS = {
       {k:'extra',l:'Detalhe (OS, metragem, kg…)',t:'text',full:1}],
     cols:[{k:'data',l:'Data',f:fdate},{k:'cat',l:'Insumo',v:r=>COMPRAS[r.cat]?.n,r:r=>`<span class="tag neutral">${esc(COMPRAS[r.cat]?.n||r.cat)}</span>`},{k:'item',l:'Produto'},{k:'fornecedor',l:'Fornecedor'},
       {k:'qtd',l:'Qtd',num:1,f:(v,r)=>v?num(v)+' '+esc(r.unid||''):''},{k:'preco',l:'Preço unit.',num:1,f:v=>v?money(v):''},{k:'total',l:'Total',num:1,f:money,tot:1},{k:'extra',l:'Detalhe',cls:'muted'}],
+    extraActions:()=>`<button class="btn" onclick="importarCompras()" title="Lança várias compras de uma vez a partir de uma planilha">📥 Importar planilha de compras</button>`,
     filters:[{k:'fornecedor',l:'Fornecedor',o:()=>[...new Set(S.db.compras.filter(r=>inYear(r.data)).map(r=>r.fornecedor).filter(Boolean))].sort()}],
     defaults:()=>({data:TODAY,cat:UI.tab.compras&&UI.tab.compras!=='all'?UI.tab.compras:'tecido',unid:'kg'}),
     compute(r){ if (!+r.total && +r.qtd && +r.preco) r.total = r2(r.qtd*r.preco); if (!+r.preco && +r.qtd && +r.total) r.preco = r2(r.total/r.qtd); },
@@ -1880,6 +1881,82 @@ window.confirmarGC = () => {
 };
 
 /* =====================================================================
+   IMPORTAÇÃO DE PLANILHA DE COMPRAS DE INSUMOS (XLSX / CSV)
+   Colunas reconhecidas: Data · Insumo · Produto · Fornecedor · Quantidade ·
+   Unidade · Preço unitário · Total · Detalhe
+   ===================================================================== */
+let CPI = null;
+const cpSig = r => `${r.data}|${norm(r.item)}|${r2(r.total).toFixed(2)}`;
+function cpInsumo(txt){
+  const t = norm(txt);
+  for (const [k, o] of Object.entries(COMPRAS)) if (t && (norm(o.n) === t || norm(o.n).startsWith(t) || t.startsWith(norm(o.n).split(' ')[0]) || k === t)) return k;
+  for (const [re, dest] of GC_REGRAS) if (dest.startsWith('c:') && re.test(t) && COMPRAS[dest.slice(2)]) return dest.slice(2);
+  return null;
+}
+window.importarCompras = () => {
+  openModal(`<div class="modal-h"><h3>📥 Importar planilha de compras</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="modal-b" style="display:block">
+      <label id="drop" class="drop"><input type="file" accept=".xlsx,.xls,.csv" style="display:none" onchange="lerCompras(this.files[0])"><div style="font-size:30px">📥</div><b>Arraste a planilha de compras (XLSX ou CSV)</b><span class="muted">Colunas: Data, Insumo, Produto, Fornecedor, Quantidade, Unidade, Preço unitário, Total, Detalhe</span></label>
+      <div class="muted" style="font-size:12px;margin-top:12px">Compras que já estão no sistema (mesma data, produto e total) vêm desmarcadas para não duplicar. Linhas sem data (como a de TOTAL) são ignoradas.</div>
+    </div>`, 'lg');
+  const d = $('#drop'); ['dragenter','dragover'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.add('on'); })); ['dragleave','drop'].forEach(ev => d.addEventListener(ev, e => { e.preventDefault(); d.classList.remove('on'); }));
+  d.addEventListener('drop', e => lerCompras(e.dataTransfer.files[0]));
+};
+window.lerCompras = async (file) => {
+  if (!file) return;
+  if (!window.XLSX){ toast('A leitura de planilhas precisa de internet (biblioteca XLSX não carregou).', true); return; }
+  try {
+    const wb = XLSX.read(new Uint8Array(await file.arrayBuffer()), {type:'array', cellDates:true});
+    const M = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {header:1, raw:true, defval:null});
+    const hi = M.findIndex(r => r && r.some(c => /^data/i.test(norm(c))) && r.some(c => /total|valor/i.test(norm(c))));
+    if (hi < 0) throw new Error('Não encontrei o cabeçalho (Data / Total) na planilha.');
+    const H = M[hi].map(c => norm(c)); const col = (...re) => { for (const r of re){ const i = H.findIndex(h => r.test(h)); if (i >= 0) return i; } return -1; };
+    const cD = col(/^data/), cI = col(/insumo/, /categoria/), cP = col(/produto/, /descri/, /item/), cF = col(/fornecedor/, /entidade/), cQ = col(/quant/, /^qtd/, /peso/, /^kg/),
+          cU = col(/unid/), cPr = col(/preco/, /unit/), cT = col(/^total/, /^valor/), cX = col(/detalhe/, /obs/);
+    const exist = new Set(S.db.compras.map(cpSig));
+    const rows = [];
+    M.slice(hi+1).forEach(r => {
+      if (!r) return; const data = gcData(r[cD]); if (!data) return;
+      const qtd = cQ>=0 ? gcNum(r[cQ]) : 0, preco = cPr>=0 ? gcNum(r[cPr]) : 0; let total = cT>=0 ? Math.abs(gcNum(r[cT])) : 0; if (!total && qtd && preco) total = r2(qtd*preco); if (!total) return;
+      const item = String(r[cP] ?? '').trim() || 'Compra (sem descrição)'; const insTxt = cI>=0 ? String(r[cI] ?? '') : '';
+      const row = {data, item, fornecedor: String(r[cF] ?? '').trim(), qtd: qtd || null, unid: String(r[cU] ?? '').trim(), preco: preco || null, total: r2(total), extra: String(r[cX] ?? '').trim(),
+        cat: cpInsumo(insTxt) || cpInsumo(item) || 'tecido'};
+      if (!row.unid) row.unid = (COMPRAS[row.cat]||{}).u || 'un';
+      row.dup = exist.has(cpSig(row)); row.ok = !row.dup; row.conferir = /conferir/i.test(row.extra);
+      row.difCalc = row.qtd && row.preco ? r2(row.total - row.qtd*row.preco) : 0;
+      rows.push(row);
+    });
+    if (!rows.length) throw new Error('Nenhuma compra encontrada na planilha.');
+    CPI = {arquivo:file.name, rows, forn:''}; previewCompras();
+  } catch(e){ toast(e.message || 'Não foi possível ler a planilha.', true); }
+};
+function previewCompras(){
+  const R = CPI.rows, sel = R.filter(r=>r.ok); const semForn = R.some(r=>!r.fornecedor);
+  const optsIns = Object.entries(COMPRAS).map(([k,o]) => `<option value="${k}">${esc(o.n)}</option>`).join('');
+  $('#modal').innerHTML = `<div class="modal-h"><h3>Conferir compras · ${esc(CPI.arquivo)}</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="modal-b" style="display:block;max-height:70vh;overflow:auto">
+      <div class="kpis" style="grid-template-columns:repeat(4,1fr)">${kpi('Linhas', String(R.length), `${R.filter(r=>r.dup).length} já no sistema`, 't-blue')}${kpi('Selecionado', kmoney(sum(sel,r=>r.total)), `${sel.length} compra(s)`, 't-green')}${kpi('Quantidade', num(r2(sum(sel.filter(r=>r.unid==='kg'),r=>r.qtd||0)))+' kg', 'somente itens em kg', 't-gray')}${kpi('A conferir', String(R.filter(r=>r.conferir).length), 'marcadas na planilha', R.some(r=>r.conferir)?'t-yellow':'t-gray')}</div>
+      ${semForn ? `<div class="fld" style="max-width:420px;margin-bottom:12px"><label>Fornecedor (para as linhas sem fornecedor)</label><input id="cp_forn" list="dl_cpf" value="${esc(CPI.forn)}" oninput="CPI.forn=this.value" placeholder="Ex.: Falcão Azul"><datalist id="dl_cpf">${[...new Set(S.db.compras.map(r=>r.fornecedor).filter(Boolean))].map(f=>`<option value="${esc(f)}">`).join('')}</datalist></div>` : ''}
+      <div class="tbl-wrap" style="max-height:none"><table class="imp-t"><thead><tr><th><input type="checkbox" ${R.every(r=>r.ok)?'checked':''} onchange="CPI.rows.forEach(r=>r.ok=this.checked);previewCompras()"></th><th>Data</th><th>Produto</th><th>Insumo</th><th class="num">Qtd</th><th class="num">Preço</th><th class="num">Total</th><th></th></tr></thead><tbody>
+      ${R.map((r,i) => `<tr class="${r.ok?'':'muted'}"><td><input type="checkbox" ${r.ok?'checked':''} onchange="CPI.rows[${i}].ok=this.checked;previewCompras()"></td><td>${fdate(r.data)}</td>
+        <td>${esc(r.item)}${r.fornecedor?`<div class="muted" style="font-size:11px">${esc(r.fornecedor)}</div>`:''}${r.extra?`<div class="muted" style="font-size:11px">${esc(r.extra)}</div>`:''}</td>
+        <td><select data-i="${i}" onchange="CPI.rows[${i}].cat=this.value">${optsIns}</select></td>
+        <td class="num">${r.qtd?num(r.qtd)+' '+esc(r.unid):''}</td><td class="num">${r.preco?money(r.preco):''}</td><td class="num">${money(r.total)}</td>
+        <td>${r.dup?'<span class="tag neutral">já lançada</span>':''}${r.conferir?'<span class="tag warn">conferir</span>':''}${Math.abs(r.difCalc)>0.05?`<span class="tag warn" title="quantidade × preço = ${money(r.qtd*r.preco)}">não fecha</span>`:''}</td></tr>`).join('')}
+      </tbody></table></div></div>
+    <div class="modal-f"><button class="btn ghost" onclick="importarCompras()">← Outro arquivo</button><span style="flex:1"></span><button class="btn ghost" onclick="closeModal()">Cancelar</button><button class="btn primary" onclick="confirmarCompras()" ${sel.length?'':'disabled'}>Lançar ${sel.length} compra(s)</button></div>`;
+  document.querySelectorAll('#modal select[data-i]').forEach(s => { s.value = CPI.rows[+s.dataset.i].cat; });
+}
+window.previewCompras = previewCompras;
+window.confirmarCompras = () => {
+  const f = ($('#cp_forn') ? $('#cp_forn').value : CPI.forn || '').trim(); let n = 0;
+  CPI.rows.filter(r => r.ok).forEach(r => { S.db.compras.push({id:uid('c'), cat:r.cat, data:r.data, item:r.item, fornecedor:r.fornecedor || f, qtd:r.qtd, unid:r.unid, preco:r.preco, total:r.total, extra:r.extra}); n++; });
+  save(); closeModal(); toast(`${n} compra(s) lançada(s) em Compras de Insumos.`);
+  const ds = CPI.rows.filter(r=>r.ok).map(r=>r.data).sort(); if (ds.length){ UI.year = +ds[ds.length-1].slice(0,4); UI.month = +ds[ds.length-1].slice(5,7); fillPeriod(); persistUI(); }
+  UI.tab.compras = 'all'; go('compras');
+};
+
+/* =====================================================================
    MODO ONLINE — Supabase (login, sincronização, tempo real, usuários)
    Ativo só quando config.js traz supabaseUrl e supabaseAnonKey.
    ===================================================================== */
@@ -2136,7 +2213,7 @@ $('#selMonth').onchange = e => { UI.month = +e.target.value; persistUI(); render
 $('#burger').onclick = () => document.body.classList.toggle('menu');
 $('#scrim').onclick = () => document.body.classList.remove('menu');
 $('#quickAdd').onclick = () => {
-  openModal(`<div class="modal-h"><h3>O que você quer lançar?</h3><button class="x" onclick="closeModal()">×</button></div><div class="modal-b"><button class="btn primary full" style="height:52px;justify-content:flex-start" onclick="importarOS()">📄 Importar Ordem de Serviço (PDF) — lança sinal, cartão e duplicata</button><button class="btn full" style="height:52px;justify-content:flex-start" onclick="importarGC()">📥 Importar Contas a Pagar do GestãoClick (XLSX)</button>${MOD_KEYS.map(k=>`<button class="btn" style="height:48px;justify-content:flex-start" onclick="closeModal();go('${k}');setTimeout(()=>editRow('${k}'),30)">${MODS[k].icon} ${MODS[k].title}</button>`).join('')}</div>`);
+  openModal(`<div class="modal-h"><h3>O que você quer lançar?</h3><button class="x" onclick="closeModal()">×</button></div><div class="modal-b"><button class="btn primary full" style="height:52px;justify-content:flex-start" onclick="importarOS()">📄 Importar Ordem de Serviço (PDF) — lança sinal, cartão e duplicata</button><button class="btn full" style="height:52px;justify-content:flex-start" onclick="importarGC()">📥 Importar Contas a Pagar do GestãoClick (XLSX)</button><button class="btn full" style="height:52px;justify-content:flex-start" onclick="importarCompras()">📥 Importar planilha de compras de insumos</button>${MOD_KEYS.map(k=>`<button class="btn" style="height:48px;justify-content:flex-start" onclick="closeModal();go('${k}');setTimeout(()=>editRow('${k}'),30)">${MODS[k].icon} ${MODS[k].title}</button>`).join('')}</div>`);
 };
 function render(){
   killCharts();
