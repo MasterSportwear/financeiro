@@ -1527,7 +1527,8 @@ window.lerExtrato = async (file) => {
 };
 window.confirmarExtrato = () => {
   const novos = BIMP.rows.filter(r=>!r.dup);
-  novos.forEach(r => S.db.banco.push({id:uid('b'), conta:r.conta, data:r.data, valor:r.valor, desc:r.desc, fitid:r.fitid||'', links:null, modo:null, ignorado:false, arquivo:BIMP.arquivo}));
+  const lote = uid('L'), em = new Date().toISOString();
+  novos.forEach(r => S.db.banco.push({id:uid('b'), conta:r.conta, data:r.data, valor:r.valor, desc:r.desc, fitid:r.fitid||'', links:null, modo:null, ignorado:false, arquivo:BIMP.arquivo, lote, importadoEm:em}));
   const n = runAutoConc(true); closeModal();
   toast(`${novos.length} movimento(s) importado(s) · ${n} conciliado(s) automaticamente.`);
   const ds = novos.map(r=>r.data).sort(); if (ds.length){ UI.year = +ds[ds.length-1].slice(0,4); UI.month = +ds[ds.length-1].slice(5,7); fillPeriod(); persistUI(); }
@@ -1550,7 +1551,7 @@ function renderConciliacao(){
   const ent = sum(ext.filter(b=>b.valor>0),b=>b.valor), sai = sum(ext.filter(b=>b.valor<0),b=>b.valor);
   const pctC = ext.length ? conc.length / ext.filter(b=>!b.ignorado).length : 0;
   const head = pageHead('Conciliação Bancária', `Cruza o <b>extrato do banco</b> com os lançamentos do sistema (vendas, recebimentos, repasses de cartão, contas pagas, compras e logística) — ${periodLabel()}.`,
-    `<button class="btn" onclick="autoConciliar()">⚡ Conciliar automaticamente</button><button class="btn" onclick="exportConc()">⬇ Excel</button><button class="btn primary" onclick="importarExtrato()">⬆ Importar extrato (OFX/CSV)</button>`);
+    `<button class="btn" onclick="arquivosExtrato()">📂 Arquivos importados</button><button class="btn" onclick="autoConciliar()">⚡ Conciliar automaticamente</button><button class="btn" onclick="exportConc()">⬇ Excel</button><button class="btn primary" onclick="importarExtrato()">⬆ Importar extrato (OFX/CSV)</button>`);
   if (!S.db.banco.length){
     $('#view').innerHTML = head + `<div class="panel"><div class="panel-b" style="padding:40px;text-align:center"><div style="font-size:40px">🏦</div><h3 style="margin:8px 0">Nenhum extrato importado ainda</h3>
       <p class="t2" style="max-width:560px;margin:0 auto 16px">Exporte o extrato da conta no internet banking em <b>OFX</b> (ou CSV) e importe aqui. O sistema encontra sozinho os lançamentos correspondentes e mostra o que está no banco e não foi lançado — e o que foi lançado e não aparece no banco.</p>
@@ -1598,6 +1599,75 @@ window.desfazerBanco = id => { const b = S.db.banco.find(x=>x.id===id); const gr
 window.bSel = (id, on) => { const s = new Set(window._bSel||[]); on ? s.add(id) : s.delete(id); window._bSel = [...s]; render(); };
 window.bSelTodos = on => { const lis = [...document.querySelectorAll('#view tbody input[type=checkbox][onchange^="bSel("]')].map(i => i.getAttribute('onchange').match(/bSel\('([^']+)'/)[1]); const s = new Set(window._bSel||[]); lis.forEach(id => on ? s.add(id) : s.delete(id)); window._bSel = [...s]; render(); };
 window.delBanco = id => confirmBox('Excluir movimento do extrato', 'Remove esta linha do extrato importado (os lançamentos do sistema não são alterados).', 'Excluir', () => { S.db.banco = S.db.banco.filter(x=>x.id!==id); save(); render(); });
+// ---------- arquivos importados: identificar e apagar ----------
+const loteKey = b => b.lote || ('arq|' + (b.arquivo || '') + '|' + b.conta);
+function lotesExtrato(){
+  const G = {};
+  S.db.banco.forEach(b => { const k = loteKey(b); (G[k] = G[k] || {key:k, arquivo:b.arquivo || '', conta:b.conta, em:b.importadoEm || '', rows:[]}).rows.push(b); });
+  return Object.values(G).map(g => { const ds = g.rows.map(r=>r.data).sort(); return Object.assign(g, {ini:ds[0], fim:ds[ds.length-1], n:g.rows.length,
+    ent:r2(sum(g.rows.filter(r=>r.valor>0),r=>r.valor)), sai:r2(sum(g.rows.filter(r=>r.valor<0),r=>r.valor)),
+    conc:g.rows.filter(r=>bStatus(r)!=='Pendente').length}); }).sort((a,b) => (b.em||b.fim||'') < (a.em||a.fim||'') ? -1 : 1);
+}
+// Duplicados: mesma conta, mesma data e mesmo valor vindos de arquivos diferentes (ou o mesmo FITID repetido).
+// Fica o movimento conciliado/ignorado, ou o importado primeiro; os demais são marcados para remoção.
+function duplicadosExtrato(){
+  const ordem = b => (bStatus(b)!=='Pendente' ? '0' : '1') + (b.fitid ? '0' : '1') + (b.importadoEm || '0000') + b.id;
+  const by = {}; S.db.banco.forEach(b => { (by[norm(b.conta)+'|'+b.data+'|'+(+b.valor).toFixed(2)] ||= []).push(b); });
+  const rem = [];
+  Object.values(by).forEach(L => { if (L.length < 2) return;
+    const usados = new Set(); const S2 = L.slice().sort((a,b)=>ordem(a)<ordem(b)?-1:1);
+    // pareia cada movimento com uma cópia de OUTRO arquivo (ou idêntica no mesmo arquivo)
+    S2.forEach((b,i) => { if (usados.has(b.id)) return; usados.add(b.id);
+      for (let j=i+1;j<S2.length;j++){ const c = S2[j]; if (usados.has(c.id)) continue;
+        const outroArq = loteKey(c) !== loteKey(b), mesmoId = b.fitid && c.fitid && b.fitid === c.fitid;
+        if (outroArq || mesmoId){ usados.add(c.id); rem.push({manter:b, remover:c}); break; } } });
+  });
+  return rem;
+}
+function apagarBancoIds(ids){
+  const del = new Set(ids); const grupos = new Set(S.db.banco.filter(b=>del.has(b.id) && b.grupo).map(b=>b.grupo));
+  S.db.banco = S.db.banco.filter(b => !del.has(b.id));
+  // um grupo de conciliação que perdeu membros volta a pendente (a soma deixou de bater)
+  S.db.banco.forEach(b => { if (b.grupo && grupos.has(b.grupo)){ b.links = null; b.modo = null; b.grupo = null; } });
+  window._bSel = []; save(); return grupos.size;
+}
+window.arquivosExtrato = () => {
+  const L = lotesExtrato(), dups = duplicadosExtrato(); const dupPorLote = {};
+  dups.forEach(d => { const k = loteKey(d.remover); dupPorLote[k] = (dupPorLote[k]||0) + 1; });
+  const fdt = iso => iso ? new Date(iso).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+  openModal(`<div class="modal-h"><h3>📂 Arquivos de extrato importados</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="modal-b" style="display:block;max-height:72vh;overflow:auto">
+      ${dups.length ? `<div class="selbar" style="margin:0 0 12px"><span>⚠️ <b>${dups.length} movimento(s) duplicado(s)</b> encontrados: mesma conta, data e valor em arquivos diferentes. Soma das cópias: <b class="mono">${money(sum(dups,d=>d.remover.valor))}</b></span>
+        <span style="margin-left:auto"><button class="btn sm primary" onclick="verDuplicados()">🧹 Revisar e remover duplicados</button></span></div>` : `<div class="muted" style="margin-bottom:12px">✓ Nenhum movimento duplicado entre os arquivos.</div>`}
+      <div class="tbl-wrap" style="max-height:none"><table><thead><tr><th>Arquivo</th><th>Conta</th><th>Importado em</th><th>Período</th><th class="num">Movimentos</th><th class="num">Entradas / Saídas</th><th></th><th></th></tr></thead><tbody>
+      ${L.map((g,i) => `<tr><td><b>${esc(g.arquivo || 'Arquivo sem nome')}</b>${g.em?'':'<div class="muted" style="font-size:11px">importação antiga (sem data registrada)</div>'}</td><td>${esc(g.conta)}</td><td style="white-space:nowrap">${fdt(g.em).replace(', ','<br>')}</td><td style="white-space:nowrap">${fdate(g.ini)}${g.fim!==g.ini?'<br>a '+fdate(g.fim):''}</td>
+        <td class="num">${g.n}${g.conc?`<div class="muted" style="font-size:11px">${g.conc} conciliado(s)</div>`:''}</td><td class="num"><span class="pos">${money(g.ent)}</span><br><span class="neg">${money(-g.sai)}</span></td>
+        <td>${dupPorLote[g.key]?`<span class="tag warn">${dupPorLote[g.key]} duplicado(s)</span>`:''}</td>
+        <td style="white-space:nowrap"><button class="btn sm danger" onclick="apagarLote(${i})">🗑 Apagar</button></td></tr>`).join('') || '<tr><td colspan="8" class="empty">Nenhum extrato importado.</td></tr>'}
+      </tbody></table></div>
+      <div class="muted" style="font-size:12px;margin-top:10px">Apagar um arquivo remove <b>todos os movimentos dele</b> da conciliação. Os lançamentos do sistema (vendas, contas, compras…) <b>não</b> são alterados — só deixam de estar conciliados com aquele extrato.</div>
+    </div><div class="modal-f"><span style="flex:1"></span><button class="btn ghost" onclick="closeModal()">Fechar</button></div>`, 'lg');
+  window._lotes = L;
+};
+window.apagarLote = i => { const g = (window._lotes||[])[i]; if (!g) return;
+  confirmBox('Apagar arquivo importado', `Remover <b>${esc(g.arquivo||'Arquivo sem nome')}</b> (${esc(g.conta)}) por completo: <b>${g.n} movimento(s)</b> de ${fdate(g.ini)} a ${fdate(g.fim)}${g.conc?`, dos quais <b>${g.conc} já conciliado(s)</b> — essas conciliações serão desfeitas`:''}.<br><br>Os lançamentos do sistema não são alterados. Esta ação não pode ser desfeita (você pode importar o arquivo de novo depois).`, 'Apagar arquivo', () => {
+    const gr = apagarBancoIds(g.rows.map(r=>r.id)); toast(`Arquivo apagado: ${g.n} movimento(s) removido(s)${gr?` · ${gr} conciliação(ões) em grupo voltaram a pendente`:''}.`); render(); setTimeout(arquivosExtrato, 0); }); };
+window.verDuplicados = () => {
+  const D = duplicadosExtrato(); window._dups = D; const arq = b => esc(b.arquivo || 'sem nome');
+  openModal(`<div class="modal-h"><h3>🧹 Movimentos duplicados no extrato</h3><button class="x" onclick="closeModal()">×</button></div>
+    <div class="modal-b" style="display:block;max-height:72vh;overflow:auto">
+      <p class="t2" style="margin-top:0">Para cada par, o sistema <b>mantém</b> o movimento já conciliado (depois o que veio de OFX, depois o importado primeiro) e <b>remove</b> a cópia. Desmarque o que não for duplicado de verdade (ex.: dois PIX iguais no mesmo dia).</p>
+      <div class="tbl-wrap" style="max-height:none"><table class="imp-t"><thead><tr><th><input type="checkbox" checked onchange="document.querySelectorAll('.dupck').forEach(c=>c.checked=this.checked)"></th><th>Data</th><th class="num">Valor</th><th>Mantém</th><th>Remove (cópia)</th></tr></thead><tbody>
+      ${D.map((d,i)=>`<tr><td><input type="checkbox" class="dupck" data-i="${i}" checked></td><td>${fdate(d.manter.data)}<div class="muted" style="font-size:11px">${esc(d.manter.conta)}</div></td><td class="num ${d.manter.valor<0?'neg':'pos'}">${money(d.manter.valor)}</td>
+        <td>${esc(d.manter.desc)}<div class="muted" style="font-size:11px">${arq(d.manter)} · ${bStatus(d.manter)}</div></td><td>${esc(d.remover.desc)}<div class="muted" style="font-size:11px">${arq(d.remover)} · ${bStatus(d.remover)}</div></td></tr>`).join('') || '<tr><td colspan="5" class="empty">Nenhum duplicado encontrado.</td></tr>'}
+      </tbody></table></div></div>
+    <div class="modal-f"><button class="btn ghost" onclick="arquivosExtrato()">← Arquivos</button><span style="flex:1"></span><button class="btn primary" ${D.length?'':'disabled'} onclick="removerDuplicados()">Remover selecionados</button></div>`, 'lg');
+};
+window.removerDuplicados = () => {
+  const ids = [...document.querySelectorAll('.dupck')].filter(c=>c.checked).map(c => window._dups[+c.dataset.i].remover.id);
+  if (!ids.length){ toast('Nenhum duplicado selecionado.', true); return; }
+  const gr = apagarBancoIds(ids); runAutoConc(true); toast(`${ids.length} movimento(s) duplicado(s) removido(s)${gr?` · ${gr} grupo(s) voltaram a pendente`:''}.`); render(); arquivosExtrato();
+};
 window.concManual = (alvo, filtro='') => {
   const ids = Array.isArray(alvo) ? alvo : [alvo]; const gkey = ids.join(','); const bs = S.db.banco.filter(x=>ids.includes(x.id)); if (!bs.length) return;
   const lm = linkMap(); const V = r2(sum(bs, x=>x.valor)); const dts = bs.map(x=>x.data).sort(); const d0 = dts[0], d1 = dts[dts.length-1];
